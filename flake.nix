@@ -21,7 +21,6 @@
               qdrant-client
               langchain
               langchain-openai
-              langchain-community
             ]);
         };
       });
