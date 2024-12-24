@@ -5,18 +5,22 @@ date: 2024-05-30
 version: 1.0
 license: MIT
 description: A pipeline for retrieving relevant information from a knowledge base using the Llama Index library.
-requirements: langchain==0.3.1, langchain_core==0.3.7, langchain_openai==0.2.1, langchain_qdrant==0.2.0
+requirements: langchain==0.3.1, langchain_core==0.3.28, langchain_openai==0.2.14, langchain_qdrant==0.2.0, langchain_text_splitters==0.3.0
 """
 
 import os
 from typing import List, Union, Generator, Iterator
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 class Pipeline:
     class Valves(BaseModel):
-        OPENAI_API_KEY: str = Field(...)
-        OPENAI_MODEL: str = Field(default="gpt-4o-mini")
-        QDRANT_URL: str = Field(default="http://localhost:6333")
+        OPENAI_API_KEY: str
+        OPENAI_MODEL: str ="gpt-4o-mini"
+        QDRANT_URL: str ="http://localhost:6333"
+
+        model_config = {
+        "extra": "allow"
+        }
 
     def __init__(self):
         self.name = "Journal RAG"
@@ -125,7 +129,7 @@ async def main():
     pipeline = Pipeline()
     await pipeline.on_startup()
     response = pipeline.pipe(
-        user_message="What can you tell me about my mother?",
+        user_message="What's the most important thing in life?",
         model_id="gpt-4o-mini",
         messages=[],
         body={}
