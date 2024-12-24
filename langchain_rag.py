@@ -50,8 +50,9 @@ class Pipeline:
         from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
         from langchain.chains import (
             create_history_aware_retriever,
-            create_retrieval_chain,
+            create_retrieval_chain
         )
+        from langchain.chains.combine_documents import create_stuff_documents_chain
 
         # Perform a similarity search
         retriever = self.vector_store.as_retriever()
@@ -95,10 +96,15 @@ class Pipeline:
             ]
         )
 
+        # Create a chain to combine the context with the user question
+        question_answer_chain = create_stuff_documents_chain(
+            self.llm, qa_prompt
+        )
+
         # Create final RAG chain
         rag_chain = create_retrieval_chain(
             history_aware_retriever,
-            qa_prompt
+            question_answer_chain  # Use the question_answer_chain here
         )
 
         response = rag_chain.invoke({
@@ -106,4 +112,26 @@ class Pipeline:
             "input": user_message
         })
 
-        return response["answer"]
+        # Ensure the response contains the expected answer
+        if "answer" in response:
+            return response["answer"]
+        else:
+            return "I don't know."
+
+    
+import asyncio
+
+async def main():
+    pipeline = Pipeline()
+    await pipeline.on_startup()
+    response = pipeline.pipe(
+        user_message="What can you tell me about my mother?",
+        model_id="gpt-4o-mini",
+        messages=[],
+        body={}
+    )
+    print(response)
+    await pipeline.on_shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(main())
