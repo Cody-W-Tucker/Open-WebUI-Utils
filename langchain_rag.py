@@ -51,7 +51,6 @@ class Pipeline:
         from langchain.chains import (
             create_history_aware_retriever,
             create_retrieval_chain,
-            create_stuff_documents_chain,
         )
 
         # Perform a similarity search
@@ -96,16 +95,10 @@ class Pipeline:
             ]
         )
 
-        # Create document combining chain using stuff method
-        question_answering_chain = create_stuff_documents_chain(
-            llm=self.llm, 
-            prompt=qa_prompt
-        )
-
         # Create final RAG chain
         rag_chain = create_retrieval_chain(
             history_aware_retriever,
-            question_answering_chain
+            qa_prompt
         )
 
         response = rag_chain.invoke({
