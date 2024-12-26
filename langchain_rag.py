@@ -35,14 +35,29 @@ class Pipeline:
     async def on_startup(self):
         from langchain_openai import ChatOpenAI, OpenAIEmbeddings
         from langchain_qdrant import QdrantVectorStore
+        from qdrant_client import QdrantClient
         
-        # Connect to the Qdrant vector store
-        self.vector_store = QdrantVectorStore.from_existing_collection(
-            embedding=OpenAIEmbeddings(model="text-embedding-3-large"),
-            collection_name="obsidian_docs",
-            url=self.valves.QDRANT_URL,  # Use the URL from the valves attribute
-        )
-        self.llm = ChatOpenAI(model=self.valves.OPENAI_MODEL)
+        try:
+            # First create a client to check collection
+            client = QdrantClient(url=self.valves.QDRANT_URL)
+            
+            # Check if collection exists
+            if not client.collection_exists("obsidian_docs"):
+                raise ValueError("Collection 'obsidian_docs' does not exist")
+                
+            # Initialize vector store
+            embeddings = OpenAIEmbeddings(model="text-embedding-3-large", api_key=self.valves.OPENAI_API_KEY)
+            self.vector_store = QdrantVectorStore(
+                client=client,
+                collection_name="obsidian_docs",
+                embedding=embeddings
+            )
+            self.llm = ChatOpenAI(model=self.valves.OPENAI_MODEL, api_key=self.valves.OPENAI_API_KEY)
+            
+        except Exception as e:
+            print(f"Failed to initialize vector store: {str(e)}")
+            raise
+
         
     async def on_shutdown(self):
         # Optional cleanup code when the server shuts down.
@@ -77,6 +92,9 @@ class Pipeline:
                 ("human", "{input}"),
             ]
         )
+
+        if not self.llm or not retriever:
+            raise ValueError("LLM or retriever not properly initialized")
 
         history_aware_retriever = create_history_aware_retriever(
             self.llm, retriever, contextualize_q_prompt
