@@ -29,7 +29,7 @@ class Pipeline:
         self.valves = self.Valves(**{
             "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", "your-api-key-here"),
             "OPENAI_MODEL": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            "QDRANT_URL": os.getenv("QDRANT_URL", "http://qdrant.homehub.tv"),
+            "QDRANT_URL": os.getenv("QDRANT_URL", "http://localhost:6333"),
         })
 
     async def on_startup(self):
