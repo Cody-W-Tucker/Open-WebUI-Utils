@@ -1,4 +1,4 @@
-from langchain_rag import Pipeline
+from pipelines.langchain_rag import Pipeline
 
 import asyncio
 
