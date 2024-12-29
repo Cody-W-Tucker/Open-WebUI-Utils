@@ -1,4 +1,4 @@
-from pipelines.langchain_rag import Pipeline
+from pipelines.chat_history_rag import Pipeline
 
 import asyncio
 

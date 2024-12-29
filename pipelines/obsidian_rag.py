@@ -1,11 +1,11 @@
 """
-title: Langchain RAG
+title: Journal RAG
 author: open-webui
 date: 2024-05-30
 version: 1.0
 license: MIT
 description: A pipeline for retrieving relevant information from a knowledge base using the Llama Index library.
-requirements: langchain, langchain_core, langchain_openai, langchain_qdrant, langchain_text_splitters
+requirements: langchain==0.3.1, langchain_core==0.3.7, langchain_openai==0.2.1, langchain_qdrant==0.2.0, langchain_text_splitters==0.3.0
 """
 
 import os
