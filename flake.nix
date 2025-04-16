@@ -21,6 +21,10 @@
               qdrant-client
               langchain
               langchain-openai
+              langgraph
+              jupyter
+              notebook
+              python-dotenv
             ]);
         };
       });
