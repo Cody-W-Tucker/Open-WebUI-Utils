@@ -27,6 +27,7 @@ class Pipeline:
         OPENAI_MODEL: str
         QDRANT_URL: str
         SYSTEM_PROMPT: str
+        OBSIDIAN_VAULT_NAME: str
         model_config = {"extra": "allow"}
 
     def __init__(self):
@@ -42,6 +43,7 @@ class Pipeline:
                 Use the following pieces of retrieved context to answer 
                 the question. If you don't know the answer, say that you 
                 don't know."""),
+            "OBSIDIAN_VAULT_NAME": os.getenv("OBSIDIAN_VAULT_NAME", "MyVault"),
         })
 
     async def on_startup(self):
@@ -135,17 +137,47 @@ class Pipeline:
 
         # Append citations if documents were retrieved
         if documents:
-            yield "\n\n**References:**\n"  # Newlines before and after the heading
-            seen_sources = set()  # To avoid duplicates
-            for i, doc in enumerate(documents, 1):
-                # Extract metadata
-                metadata = doc.metadata if isinstance(doc, Document) and hasattr(doc, "metadata") else {}
-                source = metadata.get("source", "Unknown Source")
+            # Check if we already have a references section
+            has_references = False
+            for chunk in response_stream:
+                if isinstance(chunk, str) and "References:" in chunk:
+                    has_references = True
+                    break
+            
+            # Only add a references section if one doesn't already exist
+            if not has_references:
+                # More compact header with proper spacing
+                yield "\n"
+                
+                # Collect all references first
+                references = []
+                seen_sources = set()  # To avoid duplicates
+                for i, doc in enumerate(documents, 1):
+                    # Extract metadata
+                    metadata = doc.metadata if isinstance(doc, Document) and hasattr(doc, "metadata") else {}
+                    source = metadata.get("source", "Unknown Source")
 
-                # Skip duplicates (optional)
-                if source in seen_sources:
-                    continue
-                seen_sources.add(source)
-
-                # Yield each reference on a new line
-                yield f"[{i}] {source}\n"
+                    # Skip duplicates (optional)
+                    if source in seen_sources:
+                        continue
+                    seen_sources.add(source)
+                    
+                    # Format as Obsidian URI link
+                    # Remove file extension if present for cleaner display
+                    display_name = source
+                    if "." in display_name:
+                        display_name = display_name.rsplit(".", 1)[0]
+                    
+                    # Create Obsidian URI format obsidian://open?vault=VAULT_NAME&file=FILE_PATH
+                    # URL encode the file path to handle special characters
+                    import urllib.parse
+                    encoded_file = urllib.parse.quote(source)
+                    vault_name = self.valves.OBSIDIAN_VAULT_NAME
+                    obsidian_uri = f"obsidian://open?vault={vault_name}&file={encoded_file}"
+                    
+                    # Create markdown link with the URI
+                    references.append(f"[{i}]({obsidian_uri})")
+                
+                # Output all references in a single line with separators
+                yield " | ".join(references)
+                yield "\n"
