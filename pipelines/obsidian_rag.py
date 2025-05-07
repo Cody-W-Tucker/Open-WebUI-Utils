@@ -73,7 +73,8 @@ class Pipeline:
             self.llm = ChatOpenAI(
                 model=self.valves.OPENAI_MODEL,
                 api_key=self.valves.OPENAI_API_KEY,
-                streaming=True
+                streaming=True,
+                temperature=1
             )
             print("LLM initialized")
             
