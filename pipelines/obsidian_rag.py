@@ -56,8 +56,8 @@ class Pipeline:
             client = QdrantClient(url=self.valves.QDRANT_URL, https=True)
             print("Qdrant client initialized")
             
-            if not client.collection_exists("obsidian_docs"):
-                raise ValueError("Collection 'obsidian_docs' does not exist")
+            if not client.collection_exists("main"):
+                raise ValueError("Collection 'main' does not exist")
             print("Collection exists")
             
             embeddings = OpenAIEmbeddings(model="text-embedding-3-large", api_key=self.valves.OPENAI_API_KEY)
@@ -65,7 +65,7 @@ class Pipeline:
             
             self.vector_store = QdrantVectorStore(
                 client=client,
-                collection_name="obsidian_docs",
+                collection_name="main",
                 embedding=embeddings
             )
             print("Vector store initialized")
