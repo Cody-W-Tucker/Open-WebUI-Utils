@@ -56,8 +56,8 @@ class Pipeline:
             client = QdrantClient(url=self.valves.QDRANT_URL, https=True)
             print("Qdrant client initialized")
             
-            if not client.collection_exists("main"):
-                raise ValueError("Collection 'main' does not exist")
+            if not client.collection_exists("personal"):
+                raise ValueError("Collection 'personal' does not exist")
             print("Collection exists")
             
             embeddings = OpenAIEmbeddings(model="text-embedding-3-large", api_key=self.valves.OPENAI_API_KEY)
@@ -65,7 +65,7 @@ class Pipeline:
             
             self.vector_store = QdrantVectorStore(
                 client=client,
-                collection_name="main",
+                collection_name="personal",
                 embedding=embeddings
             )
             print("Vector store initialized")
