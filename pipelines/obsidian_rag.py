@@ -5,7 +5,7 @@ date: 2024-12-30
 version: 1.0
 license: MIT
 description: A pipeline for retrieving relevant information from a knowledge base using langchain with citations.
-requirements: langchain==0.3.3, langchain_core==0.3.10, langchain_openai==0.2.2, openai==1.51.2, langchain_qdrant==0.2.0, qdrant_client==1.11.0, pydantic==2.6.4
+requirements: langchain==0.3.3, langchain_core==0.3.10, langchain_openai==0.3.18, openai==1.82.0, langchain_qdrant==0.2.0, qdrant_client==1.11.0, pydantic==2.7.4
 """
 
 import os
