@@ -4,7 +4,7 @@ author: Cody W Tucker
 date: 2024-12-30
 version: 1.0
 license: MIT
-description: A pipeline for retrieving and synthesizing information across multiple knowledge bases with relationship detection, contradiction analysis, and follow-up suggestions.
+description: A pipeline for retrieving and synthesizing information across multiple knowledge bases.
 requirements: langchain==0.3.3, langchain_core==0.3.10, langchain_openai==0.3.18, openai==1.82.0, langchain_qdrant==0.2.0, qdrant_client==1.11.0, pydantic==2.7.4
 """
 
@@ -24,23 +24,16 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain.retrievers import EnsembleRetriever
+from langchain_core.retrievers import BaseRetriever
 
 class Pipeline:
     class Valves(BaseModel):
         OPENAI_API_KEY: str
-        OPENAI_MODEL: str = "gpt-4o-mini"
+        OPENAI_MODEL: str = "gpt-4o-mini-2024-07-18"
         OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-large"
-        QDRANT_URLS: List[str] = Field(default_factory=list)
-        QDRANT_COLLECTIONS: List[str] = Field(default_factory=list)
-        COLLECTION_DESCRIPTIONS: Dict[str, str] = Field(default_factory=dict)
         SYSTEM_PROMPT: str
         OBSIDIAN_VAULT_NAME: str
         MAX_DOCUMENTS_PER_COLLECTION: int = 5
-        TEMPERATURE: float = 0.7
-        FOLLOW_UP_ENABLED: bool = True
-        CONTRADICTION_DETECTION_ENABLED: bool = True
-        RELATIONSHIP_ANALYSIS_ENABLED: bool = True
-        ENSEMBLE_WEIGHTS: Dict[str, float] = Field(default_factory=dict)
         model_config = {"extra": "allow"}
 
     def __init__(self):
@@ -50,65 +43,36 @@ class Pipeline:
         self.llm = None
         self.embeddings = None
         
-        # Parse environment variables
-        qdrant_urls = os.getenv("QDRANT_URLS", "http://qdrant.homehub.tv").split(",")
-        qdrant_collections = os.getenv("QDRANT_COLLECTIONS", "personal").split(",")
+        # Hardcoded collection values
+        self.qdrant_urls = ["http://qdrant.homehub.tv"]
+        self.qdrant_collections = ["personal", "chat_history", "research"]
         
-        # Parse collection descriptions if available
-        collection_descriptions = {}
-        desc_str = os.getenv("COLLECTION_DESCRIPTIONS", "")
-        if desc_str:
-            pairs = desc_str.split(";")
-            for pair in pairs:
-                if ":" in pair:
-                    name, desc = pair.split(":", 1)
-                    collection_descriptions[name.strip()] = desc.strip()
-                    
-        # Set default descriptions if not provided
-        for collection in qdrant_collections:
-            if collection not in collection_descriptions:
-                collection_descriptions[collection] = f"{collection} knowledge base"
+        # Hardcoded collection descriptions
+        self.collection_descriptions = {
+            "personal": "Personal knowledge base with notes, journal entries, and thoughts",
+            "chat_history": "Chat history with the user",
+            "research": "Research papers, articles, and reference materials"
+        }
         
-        # Parse ensemble weights if available
-        ensemble_weights = {}
-        weights_str = os.getenv("ENSEMBLE_WEIGHTS", "")
-        if weights_str:
-            pairs = weights_str.split(";")
-            for pair in pairs:
-                if ":" in pair:
-                    name, weight = pair.split(":", 1)
-                    try:
-                        ensemble_weights[name.strip()] = float(weight.strip())
-                    except ValueError:
-                        print(f"Invalid weight value for {name}: {weight}")
-        
-        # Set default weights if not provided (equal weights)
-        if not ensemble_weights and qdrant_collections:
-            default_weight = 1.0 / len(qdrant_collections)
-            for collection in qdrant_collections:
-                ensemble_weights[collection] = default_weight
+        # Hardcoded ensemble weights
+        self.ensemble_weights = {
+            "personal": 0.7,
+            "chat_history": 0.2,
+            "research": 0.1
+        }
         
         self.valves = self.Valves(**{
             "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", "your-api-key-here"),
-            "OPENAI_MODEL": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            "OPENAI_MODEL": os.getenv("OPENAI_MODEL", "gpt-4o-mini-2024-07-18"),
             "OPENAI_EMBEDDING_MODEL": os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large"),
-            "QDRANT_URLS": qdrant_urls,
-            "QDRANT_COLLECTIONS": qdrant_collections,
-            "COLLECTION_DESCRIPTIONS": collection_descriptions,
-            "ENSEMBLE_WEIGHTS": ensemble_weights,
             "SYSTEM_PROMPT": os.getenv("SYSTEM_PROMPT", 
                 """You are a dynamic knowledge partner capable of synthesizing insights across multiple sources.
                 Use the provided context to not just answer questions, but to highlight connections, 
                 identify patterns, and suggest new perspectives. When appropriate, note contradictions
-                or tensions between different sources. Push the user's thinking by suggesting follow-up
-                directions or unexplored angles. If you don't know the answer, acknowledge that
+                or tensions between different sources. If you don't know the answer, acknowledge that
                 and suggest alternative approaches."""),
             "OBSIDIAN_VAULT_NAME": os.getenv("OBSIDIAN_VAULT_NAME", "MyVault"),
             "MAX_DOCUMENTS_PER_COLLECTION": int(os.getenv("MAX_DOCUMENTS_PER_COLLECTION", "5")),
-            "TEMPERATURE": float(os.getenv("TEMPERATURE", "0.7")),
-            "FOLLOW_UP_ENABLED": os.getenv("FOLLOW_UP_ENABLED", "true").lower() == "true",
-            "CONTRADICTION_DETECTION_ENABLED": os.getenv("CONTRADICTION_DETECTION_ENABLED", "true").lower() == "true",
-            "RELATIONSHIP_ANALYSIS_ENABLED": os.getenv("RELATIONSHIP_ANALYSIS_ENABLED", "true").lower() == "true",
         })
 
     async def on_startup(self):
@@ -125,12 +89,12 @@ class Pipeline:
             print(f"Embeddings initialized with model {self.valves.OPENAI_EMBEDDING_MODEL}")
             
             # Print the collections we're trying to connect to
-            print(f"Attempting to connect to collections: {', '.join(self.valves.QDRANT_COLLECTIONS)}")
-            print(f"Using Qdrant URLs: {', '.join(self.valves.QDRANT_URLS)}")
+            print(f"Attempting to connect to collections: {', '.join(self.qdrant_collections)}")
+            print(f"Using Qdrant URLs: {', '.join(self.qdrant_urls)}")
             
             # Create a client for each URL
             clients = {}
-            for url in self.valves.QDRANT_URLS:
+            for url in self.qdrant_urls:
                 try:
                     clients[url] = QdrantClient(url=url, https=url.startswith("https"))
                     print(f"Connected to Qdrant at {url}")
@@ -142,7 +106,7 @@ class Pipeline:
             
             # Initialize each vector store
             # Check each collection on each client
-            for collection in self.valves.QDRANT_COLLECTIONS:
+            for collection in self.qdrant_collections:
                 connected = False
                 for url, client in clients.items():
                     try:
@@ -156,10 +120,29 @@ class Pipeline:
                             self.vector_stores[collection] = vector_store
                             
                             # Create a retriever for this collection
-                            retriever = vector_store.as_retriever(
+                            base_retriever = vector_store.as_retriever(
                                 search_kwargs={"k": self.valves.MAX_DOCUMENTS_PER_COLLECTION}
                             )
-                            self.retrievers[collection] = retriever
+                            
+                            # Create a retriever that adds collection metadata to documents
+                            class CollectionMetadataTransformer:
+                                """A simple wrapper to add collection metadata to documents."""
+                                def __init__(self, retriever, collection_name):
+                                    self.retriever = retriever
+                                    self.collection = collection_name
+                                
+                                def get_relevant_documents(self, query):
+                                    docs = self.retriever.get_relevant_documents(query)
+                                    # Add collection metadata
+                                    for doc in docs:
+                                        if isinstance(doc.metadata, dict):
+                                            doc.metadata["collection"] = self.collection
+                                        else:
+                                            doc.metadata = {"collection": self.collection}
+                                    return docs
+                            
+                            # Wrap with metadata transformer and add to retrievers dictionary
+                            self.retrievers[collection] = CollectionMetadataTransformer(base_retriever, collection)
                             
                             print(f"Vector store and retriever for {collection} initialized")
                             connected = True
@@ -181,7 +164,6 @@ class Pipeline:
                 model=self.valves.OPENAI_MODEL,
                 api_key=self.valves.OPENAI_API_KEY,
                 streaming=True,
-                temperature=self.valves.TEMPERATURE
             )
             print(f"LLM initialized with model {self.valves.OPENAI_MODEL}")
             
@@ -215,161 +197,74 @@ class Pipeline:
                 
         return result
 
-    def _analyze_document_relationships(self, documents: List[Document]) -> Dict[str, Any]:
-        """Analyze relationships between retrieved documents."""
-        if not documents or not self.valves.RELATIONSHIP_ANALYSIS_ENABLED:
-            return {}
-            
-        # Group documents by collection
-        collections = {}
-        for doc in documents:
-            collection = doc.metadata.get("collection", "unknown")
-            if collection not in collections:
-                collections[collection] = []
-            collections[collection].append(doc)
-            
-        # Look for chronological patterns
-        dates = []
-        for doc in documents:
-            date_str = doc.metadata.get("date")
-            if date_str:
-                try:
-                    # Try to parse date in various formats
-                    for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%d-%m-%Y", "%B %d, %Y"]:
-                        try:
-                            date = datetime.strptime(date_str, fmt)
-                            dates.append((date, doc))
-                            break
-                        except ValueError:
-                            continue
-                except Exception:
-                    pass
-                    
-        # Sort by date if we have dates
-        chronological_insights = None
-        if len(dates) > 1:
-            dates.sort(key=lambda x: x[0])
-            chronological_insights = {
-                "earliest": dates[0][1].page_content[:100] + "...",
-                "latest": dates[-1][1].page_content[:100] + "...",
-                "span_days": (dates[-1][0] - dates[0][0]).days
-            }
-            
-        # Look for thematic overlap using simple keyword matching
-        # In a more advanced implementation, we could use embeddings or LLM for this
-        keywords = {}
-        for doc in documents:
-            words = doc.page_content.lower().split()
-            for word in words:
-                if len(word) > 4:  # Only consider words longer than 4 characters
-                    if word not in keywords:
-                        keywords[word] = 0
-                    keywords[word] += 1
-                    
-        # Find common themes (words that appear in multiple documents)
-        common_themes = [word for word, count in keywords.items() if count > 1]
-        
-        return {
-            "collections_represented": list(collections.keys()),
-            "chronological_insights": chronological_insights,
-            "common_themes": common_themes[:5],  # Top 5 common themes
-            "cross_collection": len(collections) > 1
-        }
-
-    def _detect_contradictions(self, documents: List[Document], query: str) -> List[Dict[str, Any]]:
-        """Detect contradictions between documents."""
-        if not documents or len(documents) < 2 or not self.valves.CONTRADICTION_DETECTION_ENABLED:
-            return []
-            
-        # Simple implementation - just a placeholder
-        # In a real implementation, we would use the LLM to analyze documents for contradictions
-        # This would be done by creating pairs of documents and asking the LLM if they contradict
-        
-        # For now, return an empty list
-        return []
-
-    def _generate_follow_up_questions(self, documents: List[Document], query: str, answer: str) -> List[str]:
-        """Generate follow-up questions based on retrieved documents and the answer."""
-        if not documents or not self.valves.FOLLOW_UP_ENABLED:
-            return []
-            
-        # Simple implementation - just a placeholder
-        # In a real implementation, we would use the LLM to generate follow-up questions
-        
-        # For now, return an empty list
-        return []
-
     def _create_contextualized_ensemble_retriever(self, relevant_collections: List[str], messages: List[dict]) -> Optional[EnsembleRetriever]:
-        """Create an EnsembleRetriever from history-aware retrievers for the relevant collections."""
+        """Create an EnsembleRetriever from retrievers for the relevant collections."""
         if not relevant_collections:
             return None
             
         # Filter to only collections we have retrievers for
         available_collections = [col for col in relevant_collections if col in self.retrievers]
+        print(f"Available collections for retrieval: {available_collections}")
+        print(f"All configured collections: {self.qdrant_collections}")
+        print(f"Collections with retrievers: {list(self.retrievers.keys())}")
+        
         if not available_collections:
             return None
             
-        # Create history-aware retrievers for each collection
-        history_aware_retrievers = []
+        # Convert our custom retrievers to a format compatible with EnsembleRetriever
+        # We need to create retrievers that implement BaseRetriever but delegate to our custom retrievers
+        ensemble_retrievers = []
         retriever_weights = []
         
+        # Process each collection
         for collection in available_collections:
-            base_retriever = self.retrievers[collection]
-            collection_desc = self.valves.COLLECTION_DESCRIPTIONS.get(collection, f"{collection} knowledge base")
+            # Get our custom retriever for this collection
+            custom_retriever = self.retrievers[collection]
             
-            # Create contextualization prompt for this collection
-            contextualize_q_system_prompt = (
-                f"Given a chat history and the latest user question, "
-                f"formulate a standalone question which can be understood "
-                f"without the chat history. This query will be used to search the '{collection}' collection, "
-                f"which contains {collection_desc}. "
-                f"Do NOT answer the question, just reformulate it if needed and otherwise return it as is."
-            )
+            # Create a proper BaseRetriever implementation that delegates to our custom retriever
+            class CompatibleRetriever(BaseRetriever):
+                delegate: Any = Field(description="The retriever to delegate to")
+                collection_name: str = Field(description="The name of the collection")
+                
+                def __init__(self, delegate_retriever, collection_name):
+                    super().__init__(delegate=delegate_retriever, collection_name=collection_name)
+                
+                def _get_relevant_documents(self, query, **kwargs):
+                    # Just delegate to our custom retriever
+                    docs = self.delegate.get_relevant_documents(query)
+                    # Double-check collection metadata
+                    for doc in docs:
+                        if not doc.metadata.get("collection"):
+                            doc.metadata["collection"] = self.collection_name
+                    return docs
+                    
+            # Create a compatible retriever
+            compatible_retriever = CompatibleRetriever(custom_retriever, collection)
+                
+            # Add the compatible retriever to our list
+            ensemble_retrievers.append(compatible_retriever)
             
-            contextualize_q_prompt = ChatPromptTemplate.from_messages(
-                [("system", contextualize_q_system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")]
-            )
-            
-            # Create history-aware retriever for this collection
-            history_aware_retriever = create_history_aware_retriever(
-                self.llm, base_retriever, contextualize_q_prompt
-            )
-            
-            # Add collection metadata to documents (via a wrapper function)
-            def add_collection_metadata(input_dict):
-                # Get original documents
-                documents = history_aware_retriever.invoke(input_dict)
-                # Add collection metadata
-                for doc in documents:
-                    if hasattr(doc, "metadata"):
-                        doc.metadata["collection"] = collection
-                    else:
-                        doc.metadata = {"collection": collection}
-                return documents
-            
-            # Create a RunnableLambda to add metadata
-            retriever_with_metadata = RunnableLambda(add_collection_metadata)
-            
-            # Add to our lists
-            history_aware_retrievers.append(retriever_with_metadata)
-            
-            # Get weight for this collection (default to equal weighting if not specified)
-            weight = self.valves.ENSEMBLE_WEIGHTS.get(collection, 1.0 / len(available_collections))
+            # Get weight for this collection
+            weight = self.ensemble_weights.get(collection, 0.33)
+            print(f"Using weight {weight} for collection {collection}")
             retriever_weights.append(weight)
             
         # Create and return the ensemble retriever
-        if history_aware_retrievers:
-            return EnsembleRetriever(
-                retrievers=history_aware_retrievers,
+        if ensemble_retrievers:
+            print(f"Creating ensemble retriever with {len(ensemble_retrievers)} retrievers")
+            ensemble = EnsembleRetriever(
+                retrievers=ensemble_retrievers,
                 weights=retriever_weights
             )
+            return ensemble
         return None
 
     def pipe(self, user_message: str, model_id: str, messages: List[dict], body: dict) -> Generator[str, None, None]:
         # Determine which collections to query
         relevant_collections = self._determine_relevant_collections(user_message, messages)
+        print(f"Relevant collections determined: {', '.join(relevant_collections)}")
         
-        # Create an ensemble retriever with history-aware retrievers
+        # Create an ensemble retriever with retrievers
         ensemble_retriever = self._create_contextualized_ensemble_retriever(relevant_collections, messages)
         
         # If we couldn't create an ensemble retriever, respond accordingly
@@ -380,13 +275,101 @@ class Pipeline:
             
         # Retrieve documents using the ensemble retriever
         try:
-            all_documents = ensemble_retriever.invoke({"chat_history": messages, "input": user_message})
-            print(f"Retrieved {len(all_documents)} documents from ensemble retriever")
-            for i, doc in enumerate(all_documents):
+            print(f"Using EnsembleRetriever to retrieve documents for: '{user_message}'")
+            
+            # Use the ensemble retriever directly
+            try:
+                # Retrieve documents
+                all_documents = ensemble_retriever.get_relevant_documents(user_message)
+                
+                # Make sure collection metadata is present
+                for doc in all_documents:
+                    if not doc.metadata.get("collection"):
+                        # If we couldn't determine, use "unknown"
+                        doc.metadata["collection"] = "unknown"
+            except Exception as e:
+                print(f"Error in ensemble retriever: {str(e)}")
+                print("Falling back to retrieving from each collection separately")
+                
+                # Fallback: retrieve from each collection separately
+                all_documents = []
+                for collection in relevant_collections:
+                    if collection in self.retrievers:
+                        try:
+                            retriever = self.retrievers[collection]
+                            docs = retriever.get_relevant_documents(user_message)
+                            all_documents.extend(docs)
+                            print(f"Retrieved {len(docs)} documents from {collection}")
+                        except Exception as e:
+                            print(f"Error retrieving from {collection}: {str(e)}")
+            
+            # Print summary of retrieved documents
+            collections_found = {}
+            for doc in all_documents:
                 collection = doc.metadata.get("collection", "unknown")
-                print(f"Doc {i} from {collection}: {doc.page_content[:100]}...")
+                collections_found[collection] = collections_found.get(collection, 0) + 1
+                
+            print(f"Retrieved {len(all_documents)} total documents from collections: {collections_found}")
+            
+            # Sort documents by collection weight
+            def get_collection_weight(doc):
+                collection = doc.metadata.get("collection", "unknown")
+                return self.ensemble_weights.get(collection, 0.33)
+            
+            # Sort documents by collection weight (highest first)
+            all_documents.sort(key=get_collection_weight, reverse=True)
+            
+            # Limit total documents to avoid overloading the LLM
+            max_docs = 15
+            if len(all_documents) > max_docs:
+                print(f"Limiting from {len(all_documents)} to {max_docs} documents")
+                
+                # Group documents by collection
+                docs_by_collection = {}
+                for doc in all_documents:
+                    coll = doc.metadata.get('collection', 'unknown')
+                    if coll not in docs_by_collection:
+                        docs_by_collection[coll] = []
+                    docs_by_collection[coll].append(doc)
+                
+                # If multiple collections, keep a balanced set
+                if len(docs_by_collection) > 1:
+                    # Take documents from each collection proportional to their weights
+                    balanced_docs = []
+                    
+                    # Calculate how many to take from each collection based on weights
+                    total_weight = sum(self.ensemble_weights.get(coll, 0.33) for coll in docs_by_collection.keys())
+                    for coll, docs in docs_by_collection.items():
+                        weight = self.ensemble_weights.get(coll, 0.33)
+                        proportion = weight / total_weight
+                        num_docs = max(1, min(len(docs), round(proportion * max_docs)))
+                        balanced_docs.extend(docs[:num_docs])
+                    
+                    # If we still have space, add more from highest weighted collections
+                    remaining = max_docs - len(balanced_docs)
+                    if remaining > 0:
+                        # Sort collections by weight
+                        sorted_colls = sorted(docs_by_collection.keys(), 
+                                            key=lambda c: self.ensemble_weights.get(c, 0.33),
+                                            reverse=True)
+                        
+                        for coll in sorted_colls:
+                            if remaining <= 0:
+                                break
+                            docs = docs_by_collection[coll]
+                            used = len([d for d in balanced_docs if d.metadata.get('collection') == coll])
+                            if used < len(docs):
+                                additional = min(remaining, len(docs) - used)
+                                balanced_docs.extend(docs[used:used+additional])
+                                remaining -= additional
+                    
+                    all_documents = balanced_docs
+                else:
+                    # Just take the top max_docs
+                    all_documents = all_documents[:max_docs]
+            
         except Exception as e:
-            print(f"Error retrieving from ensemble retriever: {str(e)}")
+            print(f"Error retrieving documents: {str(e)}")
             yield f"Error retrieving information: {str(e)}"
             return
         
@@ -398,51 +381,25 @@ class Pipeline:
             
         # Make sure we have content in the documents
         has_content = False
+        content_counts = {}
         for doc in all_documents:
+            collection = doc.metadata.get("collection", "unknown")
             if doc.page_content and len(doc.page_content.strip()) > 0:
                 has_content = True
-                break
+                content_counts[collection] = content_counts.get(collection, 0) + 1
+                
+        print(f"Content counts by collection: {content_counts}")
                 
         if not has_content:
             print("Documents were retrieved but they have no content")
             yield "I found documents but they don't contain useful information. Please try a different query."
             return
-            
-        # Analyze document relationships
-        relationship_analysis = self._analyze_document_relationships(all_documents)
-        
-        # Detect contradictions
-        contradictions = self._detect_contradictions(all_documents, user_message)
         
         # Prepare system prompt with relationship and contradiction information
         system_prompt = self.valves.SYSTEM_PROMPT
         
-        # Add relationship analysis to system prompt if available
-        if relationship_analysis and self.valves.RELATIONSHIP_ANALYSIS_ENABLED:
-            system_prompt += "\n\nRelationship Analysis:"
-            if relationship_analysis.get("cross_collection"):
-                system_prompt += f"\n- Information retrieved from multiple collections: {', '.join(relationship_analysis.get('collections_represented', []))}"
-            if relationship_analysis.get("chronological_insights"):
-                insights = relationship_analysis["chronological_insights"]
-                system_prompt += f"\n- Documents span {insights.get('span_days', 'unknown')} days"
-            if relationship_analysis.get("common_themes"):
-                system_prompt += f"\n- Common themes across documents: {', '.join(relationship_analysis.get('common_themes', []))}"
-        
-        # Add contradiction information to system prompt if available
-        if contradictions and self.valves.CONTRADICTION_DETECTION_ENABLED:
-            system_prompt += "\n\nPotential Contradictions:"
-            for i, contradiction in enumerate(contradictions, 1):
-                system_prompt += f"\n{i}. {contradiction.get('description', 'Unknown contradiction')}"
-        
         # Print the documents we're using
         print(f"Using {len(all_documents)} total documents for answer generation")
-        for i, doc in enumerate(all_documents):
-            print(f"Final doc {i}: {doc.page_content[:100]}... from {doc.metadata.get('collection', 'unknown')}")
-        
-        # Format documents into a context string for easier debugging
-        formatted_context = "\n\n".join([f"Document {i+1} from {doc.metadata.get('collection', 'unknown')}:\n{doc.page_content}" 
-                                        for i, doc in enumerate(all_documents)])
-        print(f"Context length: {len(formatted_context)} characters")
         
         # Clean up system prompt and add the context tag
         system_prompt = system_prompt.rstrip() + "\n\n{context}"
@@ -458,6 +415,7 @@ class Pipeline:
         # Instead of using create_retrieval_chain with a lambda, directly pass documents to QA chain
         try:
             print("Starting answer generation")
+            
             response_stream = question_answer_chain.stream({
                 "input": user_message,
                 "chat_history": messages,
@@ -468,7 +426,7 @@ class Pipeline:
             print(f"Error generating answer: {str(e)}")
             yield f"Error: {str(e)}"
             return
-        
+            
         # Track if we've received an answer
         has_answer = False
         answer = ""
@@ -495,15 +453,6 @@ class Pipeline:
             yield "I don't know."
             return
             
-        # Generate follow-up questions
-        follow_up_questions = self._generate_follow_up_questions(all_documents, user_message, answer)
-        
-        # Add follow-up questions if available
-        if follow_up_questions and self.valves.FOLLOW_UP_ENABLED:
-            yield "\n\nFollow-up Questions:\n"
-            for i, question in enumerate(follow_up_questions, 1):
-                yield f"{i}. {question}\n"
-        
         # Append citations if documents were retrieved
         if all_documents:
             # More compact header with proper spacing
