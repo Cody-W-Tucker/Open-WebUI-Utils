@@ -23,6 +23,7 @@ from langchain.chains import create_history_aware_retriever, create_retrieval_ch
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain.retrievers import EnsembleRetriever
 
 class Pipeline:
     class Valves(BaseModel):
@@ -39,11 +40,13 @@ class Pipeline:
         FOLLOW_UP_ENABLED: bool = True
         CONTRADICTION_DETECTION_ENABLED: bool = True
         RELATIONSHIP_ANALYSIS_ENABLED: bool = True
+        ENSEMBLE_WEIGHTS: Dict[str, float] = Field(default_factory=dict)
         model_config = {"extra": "allow"}
 
     def __init__(self):
         self.name = "Context-Rich Exploratory RAG"
         self.vector_stores = {}  # Dict mapping collection name to vector store
+        self.retrievers = {}  # Dict mapping collection name to retriever
         self.llm = None
         self.embeddings = None
         
@@ -66,6 +69,25 @@ class Pipeline:
             if collection not in collection_descriptions:
                 collection_descriptions[collection] = f"{collection} knowledge base"
         
+        # Parse ensemble weights if available
+        ensemble_weights = {}
+        weights_str = os.getenv("ENSEMBLE_WEIGHTS", "")
+        if weights_str:
+            pairs = weights_str.split(";")
+            for pair in pairs:
+                if ":" in pair:
+                    name, weight = pair.split(":", 1)
+                    try:
+                        ensemble_weights[name.strip()] = float(weight.strip())
+                    except ValueError:
+                        print(f"Invalid weight value for {name}: {weight}")
+        
+        # Set default weights if not provided (equal weights)
+        if not ensemble_weights and qdrant_collections:
+            default_weight = 1.0 / len(qdrant_collections)
+            for collection in qdrant_collections:
+                ensemble_weights[collection] = default_weight
+        
         self.valves = self.Valves(**{
             "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", "your-api-key-here"),
             "OPENAI_MODEL": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
@@ -73,6 +95,7 @@ class Pipeline:
             "QDRANT_URLS": qdrant_urls,
             "QDRANT_COLLECTIONS": qdrant_collections,
             "COLLECTION_DESCRIPTIONS": collection_descriptions,
+            "ENSEMBLE_WEIGHTS": ensemble_weights,
             "SYSTEM_PROMPT": os.getenv("SYSTEM_PROMPT", 
                 """You are a dynamic knowledge partner capable of synthesizing insights across multiple sources.
                 Use the provided context to not just answer questions, but to highlight connections, 
@@ -131,7 +154,14 @@ class Pipeline:
                                 embedding=self.embeddings
                             )
                             self.vector_stores[collection] = vector_store
-                            print(f"Vector store for {collection} initialized")
+                            
+                            # Create a retriever for this collection
+                            retriever = vector_store.as_retriever(
+                                search_kwargs={"k": self.valves.MAX_DOCUMENTS_PER_COLLECTION}
+                            )
+                            self.retrievers[collection] = retriever
+                            
+                            print(f"Vector store and retriever for {collection} initialized")
                             connected = True
                             break
                         else:
@@ -269,61 +299,96 @@ class Pipeline:
         # For now, return an empty list
         return []
 
+    def _create_contextualized_ensemble_retriever(self, relevant_collections: List[str], messages: List[dict]) -> Optional[EnsembleRetriever]:
+        """Create an EnsembleRetriever from history-aware retrievers for the relevant collections."""
+        if not relevant_collections:
+            return None
+            
+        # Filter to only collections we have retrievers for
+        available_collections = [col for col in relevant_collections if col in self.retrievers]
+        if not available_collections:
+            return None
+            
+        # Create history-aware retrievers for each collection
+        history_aware_retrievers = []
+        retriever_weights = []
+        
+        for collection in available_collections:
+            base_retriever = self.retrievers[collection]
+            collection_desc = self.valves.COLLECTION_DESCRIPTIONS.get(collection, f"{collection} knowledge base")
+            
+            # Create contextualization prompt for this collection
+            contextualize_q_system_prompt = (
+                f"Given a chat history and the latest user question, "
+                f"formulate a standalone question which can be understood "
+                f"without the chat history. This query will be used to search the '{collection}' collection, "
+                f"which contains {collection_desc}. "
+                f"Do NOT answer the question, just reformulate it if needed and otherwise return it as is."
+            )
+            
+            contextualize_q_prompt = ChatPromptTemplate.from_messages(
+                [("system", contextualize_q_system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")]
+            )
+            
+            # Create history-aware retriever for this collection
+            history_aware_retriever = create_history_aware_retriever(
+                self.llm, base_retriever, contextualize_q_prompt
+            )
+            
+            # Add collection metadata to documents (via a wrapper function)
+            def add_collection_metadata(input_dict):
+                # Get original documents
+                documents = history_aware_retriever.invoke(input_dict)
+                # Add collection metadata
+                for doc in documents:
+                    if hasattr(doc, "metadata"):
+                        doc.metadata["collection"] = collection
+                    else:
+                        doc.metadata = {"collection": collection}
+                return documents
+            
+            # Create a RunnableLambda to add metadata
+            retriever_with_metadata = RunnableLambda(add_collection_metadata)
+            
+            # Add to our lists
+            history_aware_retrievers.append(retriever_with_metadata)
+            
+            # Get weight for this collection (default to equal weighting if not specified)
+            weight = self.valves.ENSEMBLE_WEIGHTS.get(collection, 1.0 / len(available_collections))
+            retriever_weights.append(weight)
+            
+        # Create and return the ensemble retriever
+        if history_aware_retrievers:
+            return EnsembleRetriever(
+                retrievers=history_aware_retrievers,
+                weights=retriever_weights
+            )
+        return None
+
     def pipe(self, user_message: str, model_id: str, messages: List[dict], body: dict) -> Generator[str, None, None]:
         # Determine which collections to query
         relevant_collections = self._determine_relevant_collections(user_message, messages)
         
-        # Initialize containers for retrieved documents
-        all_documents = []
-        documents_by_collection = {}
+        # Create an ensemble retriever with history-aware retrievers
+        ensemble_retriever = self._create_contextualized_ensemble_retriever(relevant_collections, messages)
         
-        # Query each relevant collection
-        for collection in relevant_collections:
-            if collection in self.vector_stores:
-                retriever = self.vector_stores[collection].as_retriever(
-                    search_kwargs={"k": self.valves.MAX_DOCUMENTS_PER_COLLECTION}
-                )
-                
-                # Add context about the collection
-                collection_desc = self.valves.COLLECTION_DESCRIPTIONS.get(collection, f"{collection} knowledge base")
-                
-                # Create history-aware retriever for this collection
-                contextualize_q_system_prompt = (
-                    f"Given a chat history and the latest user question, "
-                    f"formulate a standalone question which can be understood "
-                    f"without the chat history. This query will be used to search the '{collection}' collection, "
-                    f"which contains {collection_desc}. "
-                    f"Do NOT answer the question, just reformulate it if needed and otherwise return it as is."
-                )
-                
-                contextualize_q_prompt = ChatPromptTemplate.from_messages(
-                    [("system", contextualize_q_system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")]
-                )
-                
-                history_aware_retriever = create_history_aware_retriever(
-                    self.llm, retriever, contextualize_q_prompt
-                )
-                
-                # Retrieve documents from this collection
-                try:
-                    collection_docs = history_aware_retriever.invoke({"chat_history": messages, "input": user_message})
-                    print(f"Retrieved {len(collection_docs)} documents from {collection}")
-                    for i, doc in enumerate(collection_docs):
-                        print(f"Doc {i} from {collection}: {doc.page_content[:100]}...")
-                    
-                    # Add collection metadata to each document
-                    for doc in collection_docs:
-                        if hasattr(doc, "metadata"):
-                            doc.metadata["collection"] = collection
-                        else:
-                            doc.metadata = {"collection": collection}
-                    
-                    # Store documents
-                    all_documents.extend(collection_docs)
-                    documents_by_collection[collection] = collection_docs
-                    
-                except Exception as e:
-                    print(f"Error retrieving from {collection}: {str(e)}")
+        # If we couldn't create an ensemble retriever, respond accordingly
+        if not ensemble_retriever:
+            print("Could not create ensemble retriever")
+            yield "I couldn't access any knowledge bases. Please try again later or contact support."
+            return
+            
+        # Retrieve documents using the ensemble retriever
+        try:
+            all_documents = ensemble_retriever.invoke({"chat_history": messages, "input": user_message})
+            print(f"Retrieved {len(all_documents)} documents from ensemble retriever")
+            for i, doc in enumerate(all_documents):
+                collection = doc.metadata.get("collection", "unknown")
+                print(f"Doc {i} from {collection}: {doc.page_content[:100]}...")
+        except Exception as e:
+            print(f"Error retrieving from ensemble retriever: {str(e)}")
+            yield f"Error retrieving information: {str(e)}"
+            return
         
         # If no documents were retrieved, respond accordingly
         if not all_documents:
