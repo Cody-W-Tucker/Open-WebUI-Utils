@@ -10,10 +10,8 @@ requirements: langchain==0.3.3, langchain_core==0.3.10, langchain_openai==0.3.18
 
 import os
 import logging
-from typing import List, Dict, Union, Generator, Iterator, Tuple, Optional, Any, Set, Callable
+from typing import List, Dict, Generator, Optional, Any
 import pydantic
-import sys
-import urllib.parse
 import hashlib
 from datetime import datetime
 print(f"Loaded Pydantic version: {pydantic.__version__}")
@@ -21,10 +19,8 @@ print(f"Pydantic module path: {pydantic.__file__}")
 
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.documents import Document
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain.retrievers import EnsembleRetriever
 from langchain_core.retrievers import BaseRetriever
 
@@ -46,12 +42,11 @@ class Pipeline:
         OPENAI_MODEL: str = "gpt-4o-mini-2024-07-18"
         OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-large"
         SYSTEM_PROMPT: str
-        OBSIDIAN_VAULT_NAME: str
         MAX_DOCUMENTS_PER_COLLECTION: int = 5
         model_config = {"extra": "allow"}
 
     def __init__(self):
-        self.name = "Context-Rich Exploratory RAG"
+        self.name = "Agent"
         self.vector_stores = {}  # Dict mapping collection name to vector store
         self.retrievers = {}  # Dict mapping collection name to retriever
         self.llm = None
@@ -85,7 +80,6 @@ class Pipeline:
                 identify patterns, and suggest new perspectives. When appropriate, note contradictions
                 or tensions between different sources. If you don't know the answer, acknowledge that
                 and suggest alternative approaches."""),
-            "OBSIDIAN_VAULT_NAME": os.getenv("OBSIDIAN_VAULT_NAME", "MyVault"),
             "MAX_DOCUMENTS_PER_COLLECTION": int(os.getenv("MAX_DOCUMENTS_PER_COLLECTION", "5")),
         })
 
@@ -185,7 +179,7 @@ class Pipeline:
                         logger.error(f"Error checking collection '{collection}' at {url}: {str(e)}")
                 
                 if not connected:
-                    logger.warning(f"⚠️ WARNING: Could not connect to collection '{collection}' on any server")
+                    logger.warning(f"⚠️ Could not connect to collection '{collection}' on any server")
             
             if not self.vector_stores:
                 raise ValueError("No valid vector stores could be initialized")
@@ -618,7 +612,7 @@ class Pipeline:
                     answer += answer_chunk
                     yield answer_chunk
         
-        # If no answer was streamed, yield a fallback
+        # If no answer was generated from the model
         if not has_answer:
             logger.warning("No answer was generated from the model")
             yield "I don't know."
@@ -626,38 +620,37 @@ class Pipeline:
             
         # Append citations if documents were retrieved
         if all_documents:
-            # More compact header with proper spacing
-            yield "\n"
-            
-            # Collect all references first
-            references = []
+            # Send citations as events
             seen_sources = set()  # To avoid duplicates
-            for i, doc in enumerate(all_documents, 1):
+            for doc in all_documents:
                 # Extract metadata
                 metadata = doc.metadata if hasattr(doc, "metadata") else {}
                 source = metadata.get("source", "Unknown Source")
                 collection = metadata.get("collection", "Unknown Collection")
                 
-                # Skip duplicates (optional)
+                # Skip duplicates (optional) - using a set to track seen sources
                 if source in seen_sources:
                     continue
                 seen_sources.add(source)
                 
-                # Format as Obsidian URI link
-                # Remove file extension if present for cleaner display
-                display_name = source
-                if "." in display_name:
-                    display_name = display_name.rsplit(".", 1)[0]
-                
-                # Create Obsidian URI format obsidian://open?vault=VAULT_NAME&file=FILE_PATH
-                # URL encode the file path to handle special characters
-                encoded_file = urllib.parse.quote(source)
-                vault_name = self.valves.OBSIDIAN_VAULT_NAME
-                obsidian_uri = f"obsidian://open?vault={vault_name}&file={encoded_file}"
-                
-                # Create markdown link with the URI and add collection info
-                references.append(f"[{i}]({obsidian_uri}) [{collection}]")
+                yield {
+                    "event": {
+                        "type": "citation",
+                        "data": {
+                            "document": [doc.page_content],
+                            "metadata": [
+                                {
+                                    "source": source,
+                                    "collection": collection,
+                                    "date_accessed": datetime.now().isoformat(),
+                                }
+                            ],
+                            "source": {
+                                "name": source,
+                            }
+                        }
+                    }
+                }
             
-            # Output all references in a single line with separators
-            yield " | ".join(references)
+            # Final newline for spacing
             yield "\n"
