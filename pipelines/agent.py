@@ -34,12 +34,27 @@ handler = logging.StreamHandler()
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
-logger.setLevel(logging.INFO)
+
+# Determine log level from environment variable
+# In a production environment, set PIPELINE_LOG_LEVEL to WARNING or ERROR for efficiency.
+# Defaults to ERROR if not set or if an invalid value is provided.
+_log_level_str = os.getenv("PIPELINE_LOG_LEVEL", "ERROR").upper()
+_numeric_level = getattr(logging, _log_level_str, None)
+
+if not isinstance(_numeric_level, int):
+    # Use a print statement here for initial setup, as logger's level isn't set yet.
+    print(f"Warning: Invalid log level '{_log_level_str}' from PIPELINE_LOG_LEVEL. Defaulting to INFO.")
+    _numeric_level = logging.INFO
+
+logger.setLevel(_numeric_level)
+# This message will only appear if the configured level is INFO or DEBUG.
+logger.info(f"Logger initialized for '{__name__}'. Effective log level: {logging.getLevelName(logger.getEffectiveLevel())}")
 
 class Pipeline:
     class Valves(BaseModel):
         OPENAI_API_KEY: str
-        OPENAI_MODEL: str = "gpt-4o-mini-2024-07-18"
+        TASK_OPENAI_MODEL: str = "gpt-4o-mini-2024-07-18"
+        LARGE_OPENAI_MODEL: str = "gpt-4o-2024-11-20"
         OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-large"
         SYSTEM_PROMPT: str
         MAX_DOCUMENTS_PER_COLLECTION: int = 5
@@ -72,7 +87,8 @@ class Pipeline:
         
         self.valves = self.Valves(**{
             "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", "your-api-key-here"),
-            "OPENAI_MODEL": os.getenv("OPENAI_MODEL", "gpt-4o-mini-2024-07-18"),
+            "TASK_OPENAI_MODEL": os.getenv("TASK_OPENAI_MODEL", "gpt-4o-mini-2024-07-18"),
+            "LARGE_OPENAI_MODEL": os.getenv("LARGE_OPENAI_MODEL", "gpt-4o-2024-11-20"),
             "OPENAI_EMBEDDING_MODEL": os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large"),
             "SYSTEM_PROMPT": os.getenv("SYSTEM_PROMPT", 
                 """You are a dynamic knowledge partner capable of synthesizing insights across multiple sources.
@@ -187,11 +203,11 @@ class Pipeline:
                 logger.info(f"Successfully initialized {len(self.vector_stores)} vector stores: {', '.join(self.vector_stores.keys())}")
             
             self.llm = ChatOpenAI(
-                model=self.valves.OPENAI_MODEL,
+                model=self.valves.LARGE_OPENAI_MODEL,
                 api_key=self.valves.OPENAI_API_KEY,
                 streaming=True,
             )
-            logger.info(f"LLM initialized with model {self.valves.OPENAI_MODEL}")
+            logger.info(f"LLM initialized with model {self.valves.LARGE_OPENAI_MODEL}")
             
         except Exception as e:
             logger.error(f"Failed to initialize: {str(e)}")
@@ -274,7 +290,7 @@ class Pipeline:
             # Create a non-streaming version of the LLM for this specific task
             from langchain_openai import ChatOpenAI
             task_llm = ChatOpenAI(
-                model=self.valves.OPENAI_MODEL,
+                model=self.valves.TASK_OPENAI_MODEL,
                 api_key=self.valves.OPENAI_API_KEY,
                 temperature=0,  # Use low temperature for deterministic outputs
                 streaming=False,
