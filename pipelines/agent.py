@@ -69,20 +69,24 @@ class Pipeline:
         
         # Hardcoded collection values
         self.qdrant_urls = ["http://qdrant.homehub.tv"]
-        self.qdrant_collections = ["personal", "chat_history", "research"]
+        self.qdrant_collections = ["personal", "chat_history", "research", "projects", "entities"]
         
         # Hardcoded collection descriptions
         self.collection_descriptions = {
-            "personal": "Personal knowledge base with notes, journal entries, and thoughts",
-            "chat_history": "Chat history with the user",
-            "research": "Research papers, articles, and reference materials"
+            "personal": "Personal knowledge base with notes, journal entries, and thoughts.",
+            "chat_history": "Chat history with the user.",
+            "research": "Research papers, articles, and reference materials.",
+            "projects": "Current ideas and initiatives that I am working on.",
+            "entities": "List of People, Places, and Things."
         }
         
         # Hardcoded ensemble weights
         self.ensemble_weights = {
-            "personal": 0.7,
+            "personal": 0.3,
             "chat_history": 0.2,
-            "research": 0.1
+            "research": 0.1,
+            "projects": 0.1,
+            "entities": 0.3
         }
         
         self.valves = self.Valves(**{
@@ -266,12 +270,12 @@ class Pipeline:
             Reason: This is asking for research information on a scientific topic.
 
             4. Query: "What are some programming techniques I've used before?"
-            Relevant collections: personal, chat_history
-            Reason: This could be found in both personal notes and previous conversations.
+            Relevant collections: projects, chat_history
+            Reason: This could be found in both project notes and previous conversations.
 
             5. Query: "Who is John Smith?"
-            Relevant collections: personal
-            Reason: The user has a personal CRM that includes John Smith in the personal collection.
+            Relevant collections: entities
+            Reason: John is a person listed in the entities collection.
 
             USER QUERY: {query}
 
@@ -279,8 +283,7 @@ class Pipeline:
             - Analyze if the query refers to personal information, past conversations, or research topics
             - Choose ONLY the collections that are MOST relevant for answering this specific query
             - If the query mentions a topic, or concept that might be in multiple collections, include all relevant ones
-            - People are contained in the personal collection, so if they are mentioned in the query, include the personal collection
-            - Research doesn't contain people, so if the query mentions a person, it should be in the personal collection and possibly the chat_history collection
+            - Research doesn't contain people, so if the query mentions a person, it should be in the entities collection and possibly the chat_history collection
             - Return ONLY a comma-separated list of collection names, nothing else
             - If you're uncertain which is best, return 'all'
 
