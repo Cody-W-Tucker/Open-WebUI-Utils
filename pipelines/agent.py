@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 from langchain.retrievers import EnsembleRetriever
 from langchain_core.retrievers import BaseRetriever
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 # Set up logging - avoid duplicate handlers
