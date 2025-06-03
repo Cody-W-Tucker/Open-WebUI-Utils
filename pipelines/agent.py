@@ -10,19 +10,19 @@ requirements: langchain==0.3.3, langchain_core==0.3.10, langchain_openai==0.3.18
 
 import os
 import logging
-from typing import List, Dict, Generator, Optional, Any
+from typing import List, Dict, Generator, Optional, Any, Callable
 import pydantic
-import hashlib
+
 from datetime import datetime
 print(f"Loaded Pydantic version: {pydantic.__version__}")
 print(f"Pydantic module path: {pydantic.__file__}")
 
 from pydantic import BaseModel, Field
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.documents import Document
 from langchain.retrievers import EnsembleRetriever
 from langchain_core.retrievers import BaseRetriever
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 # Set up logging - avoid duplicate handlers
 logger = logging.getLogger(__name__)
@@ -65,23 +65,26 @@ class Pipeline:
         self.vector_stores = {}  # Dict mapping collection name to vector store
         self.retrievers = {}  # Dict mapping collection name to retriever
         self.llm = None
+        self.task_llm = None  # Add task_llm instance variable
         self.embeddings = None
-        
-        # Hardcoded collection values
-        self.qdrant_urls = ["http://qdrant.homehub.tv"]
-        self.qdrant_collections = ["personal", "chat_history", "research", "projects", "entities"]
-        
-        # Hardcoded collection descriptions
-        self.collection_descriptions = {
+        self.citation = False  # Disable Open WebUI's built-in citations
+
+        self.QDRANT_URLS: List[str] = ["http://qdrant.homehub.tv"]
+        self.QDRANT_COLLECTIONS: List[str] = [
+            "personal",
+            "chat_history",
+            "research",
+            "projects",
+            "entities",
+        ]
+        self.COLLECTION_DESCRIPTIONS: Dict[str, str] = {
             "personal": "Personal knowledge base with notes, journal entries, and thoughts.",
             "chat_history": "Chat history with the user.",
             "research": "Research papers, articles, and reference materials.",
             "projects": "Current ideas and initiatives that I am working on.",
             "entities": "List of People, Places, and Things."
         }
-        
-        # Hardcoded ensemble weights
-        self.ensemble_weights = {
+        self.ENSEMBLE_WEIGHTS: Dict[str, float] = {
             "personal": 0.3,
             "chat_history": 0.2,
             "research": 0.1,
@@ -89,19 +92,33 @@ class Pipeline:
             "entities": 0.3
         }
         
-        self.valves = self.Valves(**{
-            "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", "your-api-key-here"),
-            "TASK_OPENAI_MODEL": os.getenv("TASK_OPENAI_MODEL", "gpt-4o-mini-2024-07-18"),
-            "LARGE_OPENAI_MODEL": os.getenv("LARGE_OPENAI_MODEL", "gpt-4o-2024-11-20"),
-            "OPENAI_EMBEDDING_MODEL": os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large"),
-            "SYSTEM_PROMPT": os.getenv("SYSTEM_PROMPT", 
+        # Initialize valves with environment variable overrides where applicable
+        self.valves = self.Valves(
+            OPENAI_API_KEY=os.getenv("OPENAI_API_KEY", "your-api-key-here"),
+            TASK_OPENAI_MODEL=os.getenv("TASK_OPENAI_MODEL", "gpt-4o-mini-2024-07-18"),
+            LARGE_OPENAI_MODEL=os.getenv("LARGE_OPENAI_MODEL", "gpt-4o-2024-11-20"),
+            OPENAI_EMBEDDING_MODEL=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large"),
+            SYSTEM_PROMPT=os.getenv("SYSTEM_PROMPT", 
                 """You are a dynamic knowledge partner capable of synthesizing insights across multiple sources.
                 Use the provided context to not just answer questions, but to highlight connections, 
                 identify patterns, and suggest new perspectives. When appropriate, note contradictions
                 or tensions between different sources. If you don't know the answer, acknowledge that
-                and suggest alternative approaches."""),
-            "MAX_DOCUMENTS_PER_COLLECTION": int(os.getenv("MAX_DOCUMENTS_PER_COLLECTION", "5")),
-        })
+                and suggest alternative approaches."""
+            ),
+        )
+
+    def _convert_to_lc_messages(self, chat_history_dicts: List[dict]) -> List[Any]: # Using Any for BaseMessage for simplicity here
+        lc_msgs = []
+        for msg in chat_history_dicts:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role == "user":
+                lc_msgs.append(HumanMessage(content=content))
+            elif role == "assistant":
+                lc_msgs.append(AIMessage(content=content))
+            # System messages are usually not part of a history like this,
+            # but could be added if your chat_history_dicts include them.
+        return lc_msgs
 
     async def on_startup(self):
         from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -117,12 +134,12 @@ class Pipeline:
             logger.info(f"Embeddings initialized with model {self.valves.OPENAI_EMBEDDING_MODEL}")
             
             # Print the collections we're trying to connect to
-            logger.info(f"Attempting to connect to collections: {', '.join(self.qdrant_collections)}")
-            logger.info(f"Using Qdrant URLs: {', '.join(self.qdrant_urls)}")
+            logger.info(f"Attempting to connect to collections: {', '.join(self.QDRANT_COLLECTIONS)}")
+            logger.info(f"Using Qdrant URLs: {', '.join(self.QDRANT_URLS)}")
             
             # Create a client for each URL
             clients = {}
-            for url in self.qdrant_urls:
+            for url in self.QDRANT_URLS:
                 try:
                     clients[url] = QdrantClient(url=url, https=url.startswith("https"))
                     logger.info(f"Connected to Qdrant at {url}")
@@ -134,7 +151,7 @@ class Pipeline:
             
             # Initialize each vector store
             # Check each collection on each client
-            for collection in self.qdrant_collections:
+            for collection in self.QDRANT_COLLECTIONS:
                 connected = False
                 for url, client in clients.items():
                     try:
@@ -162,7 +179,12 @@ class Pipeline:
                                     super().__init__(retriever=retriever, collection=collection_name)
                                 
                                 def _get_relevant_documents(self, query, **kwargs):
-                                    docs = self.retriever.get_relevant_documents(query)
+                                    # Use invoke() if retriever supports it, otherwise fall back to get_relevant_documents
+                                    if hasattr(self.retriever, "invoke"):
+                                        docs = self.retriever.invoke(query)
+                                    else:
+                                        docs = self.retriever.get_relevant_documents(query)
+                                    
                                     # Add collection metadata
                                     for doc in docs:
                                         if isinstance(doc.metadata, dict):
@@ -173,8 +195,13 @@ class Pipeline:
                                 
                                 async def _aget_relevant_documents(self, query, **kwargs):
                                     """Async implementation for better performance."""
-                                    if hasattr(self.retriever, "aget_relevant_documents"):
+                                    # Try to use invoke() first, which is the preferred LangChain method
+                                    if hasattr(self.retriever, "ainvoke"):
+                                        docs = await self.retriever.ainvoke(query)
+                                    elif hasattr(self.retriever, "aget_relevant_documents"):
                                         docs = await self.retriever.aget_relevant_documents(query)
+                                    elif hasattr(self.retriever, "invoke"):
+                                        docs = self.retriever.invoke(query)
                                     else:
                                         # Fall back to sync if needed
                                         docs = self.retriever.get_relevant_documents(query)
@@ -213,6 +240,15 @@ class Pipeline:
             )
             logger.info(f"LLM initialized with model {self.valves.LARGE_OPENAI_MODEL}")
             
+            # Initialize task_llm for collection routing
+            self.task_llm = ChatOpenAI(
+                model=self.valves.TASK_OPENAI_MODEL,
+                api_key=self.valves.OPENAI_API_KEY,
+                temperature=0,  # Use low temperature for deterministic outputs
+                streaming=False,
+            )
+            logger.info(f"Task LLM initialized with model {self.valves.TASK_OPENAI_MODEL}")
+
         except Exception as e:
             logger.error(f"Failed to initialize: {str(e)}")
             raise
@@ -221,155 +257,114 @@ class Pipeline:
         logger.info("Shutting down Context-Rich Exploratory RAG Pipeline")
         # Clean up any resources if needed
 
-    async def _determine_relevant_collections(self, user_message: str, chat_history: List[dict]) -> List[str]:
+    async def _determine_relevant_collections(self, user_message: str) -> List[str]:
         """Determine which collections are most relevant for the query using LLM."""
-        # If LLM is not initialized, fall back to all collections
-        if not self.llm:
+        # If LLM is not initialized, return all collections
+        if not self.llm or not self.task_llm:
             logger.warning("LLM not initialized, using all collections")
             return list(self.vector_stores.keys())
         
-        # Extract recent chat context to help with collection selection
-        recent_context = ""
-        if chat_history and len(chat_history) > 0:
-            # Get last 2 exchanges
-            recent_messages = chat_history[-4:] if len(chat_history) >= 4 else chat_history
-            for msg in recent_messages:
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-                if role and content:
-                    recent_context += f"{role.capitalize()}: {content}\n"
-            
-        # Define a more structured prompt for the LLM
-        prompt = f"""You are a query router that determines which knowledge collections are most relevant for answering a user's query.
+        # Build collection descriptions string
+        collection_details = [f"- {col}: {desc}" for col, desc in self.COLLECTION_DESCRIPTIONS.items() if col in self.vector_stores]
+        collections_string = "\n".join(collection_details)
 
-                AVAILABLE COLLECTIONS:
-                """
-        
-        # Add descriptions of each collection with examples of when they would be relevant
-        for collection, description in self.collection_descriptions.items():
-            if collection in self.vector_stores:
-                prompt += f"- {collection}: {description}\n"
-        
-        # Add recent conversation context if available
-        if recent_context:
-            prompt += "\nRECENT CONVERSATION CONTEXT:\n" + recent_context + "\n"
-            
-        # Add examples to clarify when each collection is relevant
-        prompt += """
-            EXAMPLES OF COLLECTION SELECTION:
-            1. Query: "What did I write in my journal last week?"
-            Relevant collections: personal
-            Reason: This is asking about personal journal entries.
+        # Define structured prompt
+        system_message_content = f"""
+        You are a query router that determines which knowledge collections are most relevant for answering a user's query.
 
-            2. Query: "What was our conversation yesterday about machine learning?"
-            Relevant collections: chat_history, research
-            Reason: This is explicitly asking about a previous conversation and research on machine learning.
+        AVAILABLE COLLECTIONS:
+        {collections_string}
 
-            3. Query: "Tell me about recent research in quantum computing"
-            Relevant collections: research
-            Reason: This is asking for research information on a scientific topic.
+        INSTRUCTIONS:
+        - For queries about specific people (e.g., "Who is John Smith?", "Tell me about Cody Tucker"), return ONLY "entities".
+        - For queries about past conversations or chat logs, include "chat_history".
+        - For queries about research, scientific, or technical topics, include "research".
+        - For queries about personal notes, diary, or journal entries, include "personal".
+        - For queries about coding, software development, or current projects, include "projects".
+        - If a query spans multiple topics, select ALL relevant collections based on the query's intent.
+        - For vague or ambiguous queries (e.g., "Tell me something interesting"), select ALL collections.
+        - Do NOT select irrelevant collections (e.g., do NOT select "personal" for queries about people unless explicitly about journal entries).
+        - Return a comma-separated list of collection names, nothing else.
 
-            4. Query: "What are some programming techniques I've used before?"
-            Relevant collections: projects, chat_history
-            Reason: This could be found in both project notes and previous conversations.
+        EXAMPLES OF COLLECTION SELECTION:
+        1. Query: "What did I write in my journal last week?"
+        Relevant collections: personal
+        Reason: This is asking about personal journal entries.
 
-            5. Query: "Who is John Smith?"
-            Relevant collections: entities
-            Reason: John is a person listed in the entities collection.
+        2. Query: "What was our conversation yesterday about machine learning?"
+        Relevant collections: chat_history,research
+        Reason: This asks about a past conversation and a technical topic.
 
-            USER QUERY: {query}
+        3. Query: "Tell me about recent research in quantum computing"
+        Relevant collections: research
+        Reason: This is asking for research information on a scientific topic.
 
-            INSTRUCTIONS:
-            - Analyze if the query refers to personal information, past conversations, or research topics
-            - Choose ONLY the collections that are MOST relevant for answering this specific query
-            - If the query mentions a topic, or concept that might be in multiple collections, include all relevant ones
-            - Research doesn't contain people, so if the query mentions a person, it should be in the entities collection and possibly the chat_history collection
-            - Return ONLY a comma-separated list of collection names, nothing else
-            - If you're uncertain which is best, return 'all'
+        4. Query: "What are some programming techniques I've used before?"
+        Relevant collections: projects,chat_history
+        Reason: This could be found in project notes or past conversations.
 
-            RELEVANT COLLECTIONS:""".format(query=user_message)
-                    
+        5. Query: "Who is John Smith?"
+        Relevant collections: entities
+        Reason: This is asking about a specific person.
+
+        6. Query: "Tell me something about my recent projects and who worked on them"
+        Relevant collections: projects,entities
+        Reason: This involves project details and specific people.
+
+        7. Query: "What's new in my life?"
+        Relevant collections: personal,chat_history
+        Reason: This is vague but likely involves personal notes or recent conversations.
+        """
+
+        # Define human message content
+        human_template_content = f"""
+
+        USER QUERY: {user_message}
+
+        RELEVANT COLLECTION OR COLLECTIONS:
+        """
+
+        chat_prompt = ChatPromptTemplate.from_messages([
+                ("system", system_message_content),
+                ("user", human_template_content + "\n{user_message}"),
+            ])
+
         try:
-            # Create a non-streaming version of the LLM for this specific task
-            from langchain_openai import ChatOpenAI
-            task_llm = ChatOpenAI(
-                model=self.valves.TASK_OPENAI_MODEL,
-                api_key=self.valves.OPENAI_API_KEY,
-                temperature=0,  # Use low temperature for deterministic outputs
-                streaming=False,
+            response = await self.task_llm.ainvoke(
+                chat_prompt.format_prompt(user_message=user_message).to_messages()
             )
-            
-            # Call the LLM
-            response = await task_llm.ainvoke(prompt)
             collections_text = response.content.strip()
-            
-            logger.info(f"LLM response for collection selection: {collections_text}")
-            
-            # Parse the response
+
+            # Validate response format
+            if not collections_text or collections_text.lower() in ['none', '']:
+                logger.warning("LLM returned empty or invalid response, using all collections")
+                return list(self.vector_stores.keys())
+
+            # Handle 'all' explicitly
             if collections_text.lower() == 'all':
                 logger.info("LLM suggested using all collections")
                 return list(self.vector_stores.keys())
-            
-            # Split by comma and strip whitespace
-            selected_collections = [col.strip() for col in collections_text.split(',')]
-            
-            # Filter to only collections that exist in our vector stores
-            valid_collections = [col for col in selected_collections if col in self.vector_stores]
-            
-            if not valid_collections:
-                logger.warning("LLM didn't return any valid collections, using all collections")
+
+            # Normalize and split
+            collections_text = ' '.join(collections_text.split())
+            collections_text = collections_text.replace('，', ',').replace(';', ',').replace(' and ', ',')
+            selected_collections = [
+                col.strip().lower() for col in collections_text.split(',')
+                if col.strip() and col.strip().lower() in self.vector_stores
+            ]
+
+            # If no valid collections, use all collections
+            if not selected_collections:
+                logger.warning(f"No valid collections in LLM response: {collections_text}, using all collections")
                 return list(self.vector_stores.keys())
-                
-            logger.info(f"Selected collections based on LLM: {valid_collections}")
-            return valid_collections
-            
+
+            logger.info(f"Query: '{user_message}', Selected collections: {selected_collections}, Reason: LLM response='{collections_text}'")
+            return selected_collections
+
         except Exception as e:
             logger.error(f"Error using LLM for collection selection: {str(e)}", exc_info=True)
-            logger.info("Falling back to all collections")
+            logger.info("Using all collections due to error")
             return list(self.vector_stores.keys())
-
-    def _format_document_metadata(self, doc: Document) -> Dict[str, Any]:
-        """Extract and format metadata from a document."""
-        metadata = doc.metadata if hasattr(doc, "metadata") else {}
-        result = {
-            "source": metadata.get("source", "Unknown Source"),
-            "collection": metadata.get("collection", "Unknown Collection"),
-            "date": metadata.get("date", "Unknown Date"),
-        }
-        
-        # Add any other metadata that might be useful
-        for key, value in metadata.items():
-            if key not in result:
-                result[key] = value
-                
-        return result
-
-    def _create_document_hash(self, doc: Document) -> str:
-        """Create a hash of document content for deduplication."""
-        # Use a combination of content and key metadata
-        content = doc.page_content if hasattr(doc, "page_content") else ""
-        metadata = doc.metadata if hasattr(doc, "metadata") else {}
-        
-        # Include source in hash to avoid deduping different documents with similar content
-        source = metadata.get("source", "")
-        
-        # Create hash
-        hash_input = f"{content}|{source}"
-        return hashlib.md5(hash_input.encode()).hexdigest()
-
-    def _deduplicate_documents(self, documents: List[Document]) -> List[Document]:
-        """Remove duplicate documents based on content hash."""
-        unique_docs = []
-        seen_hashes = set()
-        
-        for doc in documents:
-            doc_hash = self._create_document_hash(doc)
-            if doc_hash not in seen_hashes:
-                seen_hashes.add(doc_hash)
-                unique_docs.append(doc)
-                
-        logger.info(f"Deduplicated {len(documents)} documents to {len(unique_docs)} unique documents")
-        return unique_docs
 
     def _create_contextualized_ensemble_retriever(self, relevant_collections: List[str], messages: List[dict]) -> Optional[EnsembleRetriever]:
         """Create an EnsembleRetriever from retrievers for the relevant collections."""
@@ -379,7 +374,7 @@ class Pipeline:
         # Filter to only collections we have retrievers for
         available_collections = [col for col in relevant_collections if col in self.retrievers]
         logger.info(f"Available collections for retrieval: {available_collections}")
-        logger.debug(f"All configured collections: {self.qdrant_collections}")
+        logger.debug(f"All configured collections: {self.QDRANT_COLLECTIONS}")
         logger.debug(f"Collections with retrievers: {list(self.retrievers.keys())}")
         
         if not available_collections:
@@ -395,7 +390,7 @@ class Pipeline:
             collection_weights = {available_collections[0]: 1.0}
         else:
             # Start with default weights
-            collection_weights = {col: self.ensemble_weights.get(col, 0.33) for col in available_collections}
+            collection_weights = {col: self.ENSEMBLE_WEIGHTS.get(col, 0.33) for col in available_collections}
             
             # Normalize weights to sum to 1
             total_weight = sum(collection_weights.values())
@@ -418,258 +413,242 @@ class Pipeline:
         # Create and return the ensemble retriever
         if ensemble_retrievers:
             logger.info(f"Creating ensemble retriever with {len(ensemble_retrievers)} retrievers")
-            ensemble = EnsembleRetriever(
+            
+            # Create a custom EnsembleRetriever with enhanced metadata handling
+            class EnhancedEnsembleRetriever(EnsembleRetriever):
+                def _get_relevant_documents(self, query, **kwargs):
+                    # Get documents from all retrievers
+                    all_docs = []
+                    for i, retriever in enumerate(self.retrievers):
+                        # Use invoke() if available, otherwise fall back to get_relevant_documents
+                        if hasattr(retriever, "invoke"):
+                            docs = retriever.invoke(query)
+                        else:
+                            docs = retriever.get_relevant_documents(query)
+                        logger.debug(f"Retriever {i} returned {len(docs)} documents")
+                        # Verify metadata is present
+                        for j, doc in enumerate(docs):
+                            if not hasattr(doc, 'metadata') or not doc.metadata:
+                                logger.warning(f"Document {j} from retriever {i} has no metadata! Adding empty dict.")
+                                doc.metadata = {}
+                            if 'collection' not in doc.metadata:
+                                logger.warning(f"Document {j} from retriever {i} has no collection in metadata! Collection unknown.")
+                        all_docs.append(docs)
+                    
+                    # Weight and merge documents
+                    results = []
+                    for docs, weight in zip(all_docs, self.weights):
+                        for doc in docs:
+                            # Explicitly add weight to metadata
+                            doc.metadata["weight"] = weight
+                            results.append(doc)
+                    
+                    # Log final results
+                    logger.info(f"Enhanced ensemble retriever returning {len(results)} documents")
+                    for i, doc in enumerate(results):
+                        logger.debug(f"Final document {i} metadata: {doc.metadata}")
+                    
+                    return results
+                
+                async def _aget_relevant_documents(self, query, **kwargs):
+                    """Async implementation for better performance."""
+                    # Get documents from all retrievers
+                    all_docs = []
+                    for i, retriever in enumerate(self.retrievers):
+                        # Try different methods in order of preference
+                        if hasattr(retriever, "ainvoke"):
+                            docs = await retriever.ainvoke(query)
+                        elif hasattr(retriever, "aget_relevant_documents"):
+                            docs = await retriever.aget_relevant_documents(query)
+                        elif hasattr(retriever, "invoke"):
+                            docs = retriever.invoke(query)
+                        else:
+                            docs = retriever.get_relevant_documents(query)
+                            
+                        logger.debug(f"Retriever {i} returned {len(docs)} documents")
+                        # Verify metadata is present
+                        for j, doc in enumerate(docs):
+                            if not hasattr(doc, 'metadata') or not doc.metadata:
+                                logger.warning(f"Document {j} from retriever {i} has no metadata! Adding empty dict.")
+                                doc.metadata = {}
+                            if 'collection' not in doc.metadata:
+                                logger.warning(f"Document {j} from retriever {i} has no collection in metadata! Collection unknown.")
+                        all_docs.append(docs)
+                    
+                    # Weight and merge documents
+                    results = []
+                    for docs, weight in zip(all_docs, self.weights):
+                        for doc in docs:
+                            # Explicitly add weight to metadata
+                            doc.metadata["weight"] = weight
+                            results.append(doc)
+                    
+                    # Log final results
+                    logger.info(f"Enhanced ensemble retriever returning {len(results)} documents")
+                    for i, doc in enumerate(results):
+                        logger.debug(f"Final document {i} metadata: {doc.metadata}")
+                    
+                    return results
+            
+            # Use our enhanced retriever
+            ensemble = EnhancedEnsembleRetriever(
                 retrievers=ensemble_retrievers,
                 weights=retriever_weights
             )
             return ensemble
         return None
 
-    def pipe(self, user_message: str, model_id: str, messages: List[dict], body: dict) -> Generator[str, None, None]:
-        # Log the actual user message we're processing
+    def pipe(
+        self,
+        user_message: str,
+        model_id: str,
+        messages: List[dict],
+        body: dict,
+        __event_emitter__: Optional[Callable[[dict], None]] = None,
+    ) -> Generator[str, None, None]:
+        from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
         logger.info(f"Processing query: '{user_message}'")
         
-        # Determine which collections to query - call async function from sync context
         try:
+            # Create an event loop if one doesn't exist
             import asyncio
-            relevant_collections = asyncio.run(self._determine_relevant_collections(user_message, messages))
-        except RuntimeError:
-            # RuntimeError might occur if there's already an event loop running
-            # Fall back to all collections
-            logger.warning("Could not run async collection determination, using all collections")
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            # Run the async collection determination
+            relevant_collections = loop.run_until_complete(
+                self._determine_relevant_collections(user_message)
+            )
+        except Exception as e: 
+            logger.error(f"Could not run collection determination due to {str(e)}", exc_info=True)
+            logger.info("Using all collections due to error")
             relevant_collections = list(self.vector_stores.keys())
             
-        if not isinstance(relevant_collections, list):
-            logger.warning(f"Collection determination returned non-list: {type(relevant_collections)}")
+        if not isinstance(relevant_collections, list) or not relevant_collections:
+            logger.warning(f"Collection determination returned invalid result: {relevant_collections}. Using all vector stores.")
             relevant_collections = list(self.vector_stores.keys())
+            if not relevant_collections:
+                logger.error("No vector stores available even after fallback.")
+                if __event_emitter__:
+                    __event_emitter__({"type": "stream", "data": "I couldn't access any knowledge bases. Please try again later or contact support."})
+                yield "I couldn't access any knowledge bases. Please try again later or contact support."
+                return
             
         logger.info(f"Relevant collections determined: {', '.join(relevant_collections)}")
         
-        # Create an ensemble retriever with retrievers
         ensemble_retriever = self._create_contextualized_ensemble_retriever(relevant_collections, messages)
         
-        # If we couldn't create an ensemble retriever, respond accordingly
         if not ensemble_retriever:
             logger.error("Could not create ensemble retriever")
+            if __event_emitter__:
+                __event_emitter__({"type": "stream", "data": "I couldn't access any knowledge bases. Please try again later or contact support."})
             yield "I couldn't access any knowledge bases. Please try again later or contact support."
             return
-            
-        # Retrieve documents using the ensemble retriever
+
+        # Retrieve relevant documents
         try:
-            logger.info(f"Using EnsembleRetriever to retrieve documents for: '{user_message}'")
+            logger.info(f"Retrieving documents for query: '{user_message}'")
+            # Use invoke() if available, otherwise fall back to get_relevant_documents
+            if hasattr(ensemble_retriever, "invoke"):
+                docs = ensemble_retriever.invoke(user_message)
+            else:
+                docs = ensemble_retriever.get_relevant_documents(user_message)
+            logger.info(f"Retrieved {len(docs)} documents")
             
-            # Use the ensemble retriever directly
-            try:
-                # Retrieve documents
-                all_documents = ensemble_retriever.get_relevant_documents(user_message)
-                
-                # Make sure collection metadata is present
-                for doc in all_documents:
-                    if not doc.metadata.get("collection"):
-                        # If we couldn't determine, use "unknown"
-                        doc.metadata["collection"] = "unknown"
-            except Exception as e:
-                logger.error(f"Error in ensemble retriever: {str(e)}", exc_info=True)
-                logger.info("Falling back to retrieving from each collection separately")
-                
-                # Fallback: retrieve from each collection separately
-                all_documents = []
-                for collection in relevant_collections:
-                    if collection in self.retrievers:
-                        try:
-                            retriever = self.retrievers[collection]
-                            docs = retriever.get_relevant_documents(user_message)
-                            all_documents.extend(docs)
-                            logger.info(f"Retrieved {len(docs)} documents from {collection}")
-                        except Exception as e:
-                            logger.error(f"Error retrieving from {collection}: {str(e)}", exc_info=True)
+            # Log document details for debugging
+            for i, doc in enumerate(docs):
+                logger.info(f"Document {i} content length: {len(doc.page_content)}")
+                logger.info(f"Document {i} metadata: {doc.metadata}")
+                # Check if required metadata fields exist
+                if not hasattr(doc, 'metadata') or not doc.metadata:
+                    logger.warning(f"Document {i} has no metadata!")
+                elif 'source' not in doc.metadata:
+                    logger.warning(f"Document {i} has no source in metadata!")
+                elif 'collection' not in doc.metadata:
+                    logger.warning(f"Document {i} has no collection in metadata!")
             
-            # Deduplicate documents
-            all_documents = self._deduplicate_documents(all_documents)
+            # Build context from documents
+            context = "\n\n".join([doc.page_content for doc in docs])
             
-            # Print summary of retrieved documents
-            collections_found = {}
-            for doc in all_documents:
-                collection = doc.metadata.get("collection", "unknown")
-                collections_found[collection] = collections_found.get(collection, 0) + 1
-                
-            logger.info(f"Retrieved {len(all_documents)} total documents from collections: {collections_found}")
+            # Define the system prompt with context
+            system_prompt = self.valves.SYSTEM_PROMPT + "\n\nUse the following context to answer the question:\n\n" + context
             
-            # Sort documents by collection weight
-            def get_collection_weight(doc):
-                collection = doc.metadata.get("collection", "unknown")
-                return self.ensemble_weights.get(collection, 0.33)
+            # Direct chat with OpenAI
+            # Create a fresh streaming LLM instance
+            streaming_llm = ChatOpenAI(
+                model=self.valves.LARGE_OPENAI_MODEL,
+                api_key=self.valves.OPENAI_API_KEY,
+                streaming=True,
+            )
             
-            # Sort documents by collection weight (highest first)
-            all_documents.sort(key=get_collection_weight, reverse=True)
+            # Create a simple prompt
+            prompt = ChatPromptTemplate.from_messages([
+                SystemMessage(content=system_prompt),
+                MessagesPlaceholder(variable_name="history"),
+                HumanMessage(content="{question}"),
+            ])
             
-            # Limit total documents to avoid overloading the LLM
-            max_docs = 15
-            if len(all_documents) > max_docs:
-                logger.info(f"Limiting from {len(all_documents)} to {max_docs} documents")
-                
-                # Group documents by collection
-                docs_by_collection = {}
-                for doc in all_documents:
-                    coll = doc.metadata.get('collection', 'unknown')
-                    if coll not in docs_by_collection:
-                        docs_by_collection[coll] = []
-                    docs_by_collection[coll].append(doc)
-                
-                # If multiple collections, keep a balanced set
-                if len(docs_by_collection) > 1:
-                    # Take documents from each collection proportional to their weights
-                    balanced_docs = []
+            # Convert main messages to LangChain messages for history
+            history_lc_messages = self._convert_to_lc_messages(messages)
+            
+            # Create a simple chain
+            chain = prompt | streaming_llm
+            
+            # Stream the response
+            logger.info("Starting to stream response")
+            answer = ""
+            for chunk in chain.stream({"question": user_message, "history": history_lc_messages}):
+                # ChatOpenAI with streaming=True returns chunks with a .content attribute
+                if hasattr(chunk, 'content'):
+                    chunk_text = chunk.content
+                    answer += chunk_text
+                    if __event_emitter__:
+                        __event_emitter__({"type": "stream", "data": chunk_text})
+                    yield chunk_text
+            
+            # After streaming the answer, emit citations
+            if docs:
+                logger.info(f"Emitting citations for {len(docs)} source documents")
+                seen_sources = set()  # To avoid duplicates
+                for doc in docs:
+                    # Extract metadata
+                    metadata = doc.metadata if hasattr(doc, "metadata") else {}
+                    source = metadata.get("source", "Unknown Source")
+                    collection = metadata.get("collection", "Unknown Collection")
                     
-                    # Calculate how many to take from each collection based on weights
-                    total_weight = sum(self.ensemble_weights.get(coll, 0.33) for coll in docs_by_collection.keys())
-                    for coll, docs in docs_by_collection.items():
-                        weight = self.ensemble_weights.get(coll, 0.33)
-                        proportion = weight / total_weight
-                        num_docs = max(1, min(len(docs), round(proportion * max_docs)))
-                        balanced_docs.extend(docs[:num_docs])
+                    # Skip duplicates
+                    if source in seen_sources:
+                        continue
+                    seen_sources.add(source)
                     
-                    # If we still have space, add more from highest weighted collections
-                    remaining = max_docs - len(balanced_docs)
-                    if remaining > 0:
-                        # Sort collections by weight
-                        sorted_colls = sorted(docs_by_collection.keys(), 
-                                            key=lambda c: self.ensemble_weights.get(c, 0.33),
-                                            reverse=True)
-                        
-                        for coll in sorted_colls:
-                            if remaining <= 0:
-                                break
-                            docs = docs_by_collection[coll]
-                            used = len([d for d in balanced_docs if d.metadata.get('collection') == coll])
-                            if used < len(docs):
-                                additional = min(remaining, len(docs) - used)
-                                balanced_docs.extend(docs[used:used+additional])
-                                remaining -= additional
-                    
-                    all_documents = balanced_docs
-                else:
-                    # Just take the top max_docs
-                    all_documents = all_documents[:max_docs]
-            
-        except Exception as e:
-            logger.error(f"Error retrieving documents: {str(e)}", exc_info=True)
-            yield f"Error retrieving information: {str(e)}"
-            return
-        
-        # If no documents were retrieved, respond accordingly
-        if not all_documents:
-            logger.warning("No documents were retrieved from any collection")
-            yield "I couldn't find any relevant information in my knowledge base. Could you provide more details or try a different question?"
-            return
-            
-        # Make sure we have content in the documents
-        has_content = False
-        content_counts = {}
-        for doc in all_documents:
-            collection = doc.metadata.get("collection", "unknown")
-            if doc.page_content and len(doc.page_content.strip()) > 0:
-                has_content = True
-                content_counts[collection] = content_counts.get(collection, 0) + 1
-                
-        logger.info(f"Content counts by collection: {content_counts}")
-                
-        if not has_content:
-            logger.warning("Documents were retrieved but they have no content")
-            yield "I found documents but they don't contain useful information. Please try a different query."
-            return
-        
-        # Prepare system prompt with relationship and contradiction information
-        system_prompt = self.valves.SYSTEM_PROMPT
-        
-        # Print the documents we're using
-        logger.info(f"Using {len(all_documents)} total documents for answer generation")
-        
-        # Clean up system prompt and add the context tag
-        system_prompt = system_prompt.rstrip() + "\n\n{context}"
-        
-        # Create QA prompt
-        qa_prompt = ChatPromptTemplate.from_messages(
-            [("system", system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")]
-        )
-        
-        # Create QA chain
-        question_answer_chain = create_stuff_documents_chain(self.llm, qa_prompt)
-        
-        # Instead of using create_retrieval_chain with a lambda, directly pass documents to QA chain
-        try:
-            logger.info("Starting answer generation")
-            
-            response_stream = question_answer_chain.stream({
-                "input": user_message,
-                "chat_history": messages,
-                "context": all_documents
-            })
-            logger.info("Got response stream")
-        except Exception as e:
-            logger.error(f"Error generating answer: {str(e)}", exc_info=True)
-            yield f"Error: {str(e)}"
-            return
-            
-        # Track if we've received an answer
-        has_answer = False
-        answer = ""
-        
-        # Stream the answer chunks
-        for chunk in response_stream:
-            # Handle different response formats
-            if isinstance(chunk, str):
-                # Direct string response
-                has_answer = True
-                answer += chunk
-                yield chunk
-            elif isinstance(chunk, dict):
-                # Dictionary response (typical for chain output)
-                if "answer" in chunk:
-                    has_answer = True
-                    answer_chunk = chunk["answer"]
-                    answer += answer_chunk
-                    yield answer_chunk
-        
-        # If no answer was generated from the model
-        if not has_answer:
-            logger.warning("No answer was generated from the model")
-            yield "I don't know."
-            return
-            
-        # Append citations if documents were retrieved
-        if all_documents:
-            # Send citations as events
-            seen_sources = set()  # To avoid duplicates
-            for doc in all_documents:
-                # Extract metadata
-                metadata = doc.metadata if hasattr(doc, "metadata") else {}
-                source = metadata.get("source", "Unknown Source")
-                collection = metadata.get("collection", "Unknown Collection")
-                
-                # Skip duplicates (optional) - using a set to track seen sources
-                if source in seen_sources:
-                    continue
-                seen_sources.add(source)
-                
-                yield {
-                    "event": {
-                        "type": "citation",
-                        "data": {
-                            "document": [doc.page_content],
-                            "metadata": [
-                                {
-                                    "source": source,
-                                    "collection": collection,
-                                    "date_accessed": datetime.now().isoformat(),
+                    yield {
+                        "event": {
+                            "type": "citation",
+                            "data": {
+                                "document": [doc.page_content],
+                                "metadata": [
+                                    {
+                                        "source": source,
+                                        "collection": collection,
+                                        "date_accessed": datetime.now().isoformat(),
+                                    }
+                                ],
+                                "source": {
+                                    "name": source,
                                 }
-                            ],
-                            "source": {
-                                "name": source,
                             }
                         }
                     }
-                }
-            
-            # Final newline for spacing
+
             yield "\n"
+
+        except Exception as e:
+            logger.error(f"Error during chain execution: {str(e)}", exc_info=True)
+            if __event_emitter__:
+                __event_emitter__({"type": "stream", "data": f"Error processing your request: {str(e)}"})
+            yield f"Error processing your request: {str(e)}"
+            return
