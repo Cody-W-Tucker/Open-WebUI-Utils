@@ -42,7 +42,8 @@ class Pipeline:
                 """You are an assistant for question-answering tasks. 
                 Use the following pieces of retrieved context to answer 
                 the question. If you don't know the answer, say that you 
-                don't know."""),
+                don't know.
+                """),
             "OBSIDIAN_VAULT_NAME": os.getenv("OBSIDIAN_VAULT_NAME", "MyVault"),
         })
 
@@ -106,8 +107,35 @@ class Pipeline:
         
         # Always append the context tag to the system prompt
         system_prompt = self.valves.SYSTEM_PROMPT
+
+        # Define footnote additions
+        footnote_additions = """
+        IMPORTANT: You MUST include footnote references [^n] in your response whenever you use information from the retrieved context.
+        
+        Rules for using footnotes:
+        1. Add [^n] at the end of any sentence that uses information from the context
+        2. Use [^n] after specific facts, quotes, or ideas from the sources
+        3. You can use multiple footnotes for a single sentence if it combines information from different sources
+        4. Number the footnotes sequentially starting from [^1]
+        5. Make sure every piece of information from the context has a corresponding footnote
+        6. DO NOT add any descriptive text after the footnote numbers - just use [^n] format
+        7. DO NOT create your own footnote section - the system will automatically add the References section
+        
+        Example response:
+        "The project was first announced in 2020 [^1] and has since grown significantly [^2]. According to the latest report [^3], it now serves over 1 million users. The team's innovative approach [^4] has been key to this success."
+
+        The system will automatically add the References section with the correct links at the end of your response. NEVER include a References section in your response.
+        """
+
+        # Define context format
+        context_formatted = """
+        Context to pull references from:
+
+        {context}
+        """
+
         # Clean up any trailing whitespace and add the context tag
-        system_prompt = system_prompt.rstrip() + "\n\n{context}"
+        system_prompt = system_prompt.rstrip() + footnote_additions + context_formatted
 
         qa_prompt = ChatPromptTemplate.from_messages(
             [("system", system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")]
@@ -147,8 +175,8 @@ class Pipeline:
             
             # Only add a references section if one doesn't already exist
             if not has_references:
-                # More compact header with proper spacing
-                yield "\n"
+                # Output all references in a single line with spaces
+                yield "\n\n---\n\nReferences:\n\n"
                 
                 # Collect all references first
                 references = []
@@ -158,27 +186,19 @@ class Pipeline:
                     metadata = doc.metadata if isinstance(doc, Document) and hasattr(doc, "metadata") else {}
                     source = metadata.get("source", "Unknown Source")
 
-                    # Skip duplicates (optional)
+                    # Skip duplicates
                     if source in seen_sources:
                         continue
                     seen_sources.add(source)
                     
-                    # Format as Obsidian URI link
                     # Remove file extension if present for cleaner display
                     display_name = source
                     if "." in display_name:
                         display_name = display_name.rsplit(".", 1)[0]
                     
-                    # Create Obsidian URI format obsidian://open?vault=VAULT_NAME&file=FILE_PATH
-                    # URL encode the file path to handle special characters
-                    import urllib.parse
-                    encoded_file = urllib.parse.quote(source)
-                    vault_name = self.valves.OBSIDIAN_VAULT_NAME
-                    obsidian_uri = f"obsidian://open?vault={vault_name}&file={encoded_file}"
-                    
-                    # Create markdown link with the URI
-                    references.append(f"[{i}]({obsidian_uri})")
+                    # Create numbered footnote format
+                    references.append(f"[^{i}]: [[{display_name}]]")
                 
-                # Output all references in a single line with separators
-                yield " | ".join(references)
+                # Output references as numbered footnotes
+                yield "\n".join(references)
                 yield "\n"
