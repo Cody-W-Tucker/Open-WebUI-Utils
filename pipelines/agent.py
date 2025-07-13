@@ -58,6 +58,7 @@ class Pipeline:
         OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-large"
         SYSTEM_PROMPT: str
         MAX_DOCUMENTS_PER_COLLECTION: int = 5
+        QDRANT_URL: str
         model_config = {"extra": "allow"}
 
     def __init__(self):
@@ -69,7 +70,7 @@ class Pipeline:
         self.embeddings = None
         self.citation = False  # Disable Open WebUI's built-in citations
 
-        self.QDRANT_URLS: List[str] = ["http://qdrant.homehub.tv"]
+        self.QDRANT_URL = None
         self.QDRANT_COLLECTIONS: List[str] = [
             "personal",
             "chat_history",
@@ -105,6 +106,7 @@ class Pipeline:
                 or tensions between different sources. If you don't know the answer, acknowledge that
                 and suggest alternative approaches."""
             ),
+            QDRANT_URL=os.getenv("QDRANT_URL", "http://localhost:6333")
         )
 
     def _convert_to_lc_messages(self, chat_history_dicts: List[dict]) -> List[Any]: # Using Any for BaseMessage for simplicity here
@@ -135,98 +137,142 @@ class Pipeline:
             
             # Print the collections we're trying to connect to
             logger.info(f"Attempting to connect to collections: {', '.join(self.QDRANT_COLLECTIONS)}")
-            logger.info(f"Using Qdrant URLs: {', '.join(self.QDRANT_URLS)}")
+            logger.info(f"Using Qdrant URL: {self.valves.QDRANT_URL}")
             
-            # Create a client for each URL
-            clients = {}
-            for url in self.QDRANT_URLS:
+            # Create a single client with better debugging
+            logger.info(f"Attempting to connect to Qdrant URL: {self.valves.QDRANT_URL}")
+            logger.info(f"URL starts with https: {self.valves.QDRANT_URL.startswith('https')}")
+            
+            # Test basic network connectivity
+            import urllib.parse
+            parsed_url = urllib.parse.urlparse(self.valves.QDRANT_URL)
+            logger.info(f"Parsed URL - scheme: {parsed_url.scheme}, netloc: {parsed_url.netloc}, path: {parsed_url.path}")
+            
+            # Try to ping the host to see if it's reachable
+            import socket
+            try:
+                host = parsed_url.netloc.split(':')[0] if ':' in parsed_url.netloc else parsed_url.netloc
+                port = int(parsed_url.netloc.split(':')[1]) if ':' in parsed_url.netloc else (443 if parsed_url.scheme == 'https' else 80)
+                logger.info(f"Testing connectivity to {host}:{port}")
+                
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)
+                result = sock.connect_ex((host, port))
+                sock.close()
+                
+                if result == 0:
+                    logger.info(f"Network connectivity test passed for {host}:{port}")
+                else:
+                    logger.warning(f"Network connectivity test failed for {host}:{port} (error code: {result})")
+            except Exception as net_e:
+                logger.warning(f"Network connectivity test failed: {str(net_e)}")
+            
+            try:
+                # Try the standard connection first
+                client = QdrantClient(url=self.valves.QDRANT_URL, https=self.valves.QDRANT_URL.startswith("https"))
+                logger.info(f"Successfully connected to Qdrant at {self.valves.QDRANT_URL}")
+                
+                # Test the connection by getting server info
                 try:
-                    clients[url] = QdrantClient(url=url, https=url.startswith("https"))
-                    logger.info(f"Connected to Qdrant at {url}")
-                except Exception as e:
-                    logger.error(f"Failed to connect to Qdrant at {url}: {str(e)}")
-            
-            if not clients:
-                raise ValueError("Could not connect to any Qdrant servers")
+                    collections_info = client.get_collections()
+                    logger.info(f"Connection test successful. Server responded with collections info.")
+                except Exception as test_e:
+                    logger.warning(f"Connected but couldn't get collections info: {str(test_e)}")
+                    
+            except Exception as e:
+                logger.error(f"Failed to connect to Qdrant at {self.valves.QDRANT_URL}: {str(e)}")
+                
+                # Try alternative connection methods
+                logger.info("Trying alternative connection methods...")
+                
+                # Try without https flag
+                try:
+                    logger.info("Trying without https flag...")
+                    client = QdrantClient(url=self.valves.QDRANT_URL)
+                    logger.info(f"Alternative connection successful: {self.valves.QDRANT_URL}")
+                except Exception as e2:
+                    logger.error(f"Alternative connection failed: {str(e2)}")
+                    
+                    # Try with explicit https=True
+                    try:
+                        logger.info("Trying with explicit https=True...")
+                        client = QdrantClient(url=self.valves.QDRANT_URL, https=True)
+                        logger.info(f"HTTPS connection successful: {self.valves.QDRANT_URL}")
+                    except Exception as e3:
+                        logger.error(f"HTTPS connection also failed: {str(e3)}")
+                        raise ValueError(f"Could not connect to Qdrant server at {self.valves.QDRANT_URL}. All connection methods failed.")
             
             # Initialize each vector store
-            # Check each collection on each client
+            # Check each collection on the client
             for collection in self.QDRANT_COLLECTIONS:
-                connected = False
-                for url, client in clients.items():
-                    try:
-                        if client.collection_exists(collection):
-                            logger.info(f"Collection '{collection}' exists at {url}")
-                            vector_store = QdrantVectorStore(
-                                client=client,
-                                collection_name=collection,
-                                embedding=self.embeddings
-                            )
-                            self.vector_stores[collection] = vector_store
+                try:
+                    if client.collection_exists(collection):
+                        logger.info(f"Collection '{collection}' exists")
+                        vector_store = QdrantVectorStore(
+                            client=client,
+                            collection_name=collection,
+                            embedding=self.embeddings
+                        )
+                        self.vector_stores[collection] = vector_store
+                        
+                        # Create a retriever for this collection
+                        base_retriever = vector_store.as_retriever(
+                            search_kwargs={"k": self.valves.MAX_DOCUMENTS_PER_COLLECTION}
+                        )
+                        
+                        # Create a retriever that adds collection metadata to documents
+                        class CollectionMetadataRetriever(BaseRetriever):
+                            """A proper BaseRetriever implementation that adds collection metadata to documents."""
+                            retriever: Any = Field(description="The retriever to delegate to")
+                            collection: str = Field(description="The collection name")
                             
-                            # Create a retriever for this collection
-                            base_retriever = vector_store.as_retriever(
-                                search_kwargs={"k": self.valves.MAX_DOCUMENTS_PER_COLLECTION}
-                            )
+                            def __init__(self, retriever, collection_name):
+                                super().__init__(retriever=retriever, collection=collection_name)
                             
-                            # Create a retriever that adds collection metadata to documents
-                            class CollectionMetadataRetriever(BaseRetriever):
-                                """A proper BaseRetriever implementation that adds collection metadata to documents."""
-                                retriever: Any = Field(description="The retriever to delegate to")
-                                collection: str = Field(description="The collection name")
+                            def _get_relevant_documents(self, query, **kwargs):
+                                # Use invoke() if retriever supports it, otherwise fall back to get_relevant_documents
+                                if hasattr(self.retriever, "invoke"):
+                                    docs = self.retriever.invoke(query)
+                                else:
+                                    docs = self.retriever.get_relevant_documents(query)
                                 
-                                def __init__(self, retriever, collection_name):
-                                    super().__init__(retriever=retriever, collection=collection_name)
-                                
-                                def _get_relevant_documents(self, query, **kwargs):
-                                    # Use invoke() if retriever supports it, otherwise fall back to get_relevant_documents
-                                    if hasattr(self.retriever, "invoke"):
-                                        docs = self.retriever.invoke(query)
+                                # Add collection metadata
+                                for doc in docs:
+                                    if isinstance(doc.metadata, dict):
+                                        doc.metadata["collection"] = self.collection
                                     else:
-                                        docs = self.retriever.get_relevant_documents(query)
-                                    
-                                    # Add collection metadata
-                                    for doc in docs:
-                                        if isinstance(doc.metadata, dict):
-                                            doc.metadata["collection"] = self.collection
-                                        else:
-                                            doc.metadata = {"collection": self.collection}
-                                    return docs
+                                        doc.metadata = {"collection": self.collection}
+                                return docs
+                            
+                            async def _aget_relevant_documents(self, query, **kwargs):
+                                """Async implementation for better performance."""
+                                # Try to use invoke() first, which is the preferred LangChain method
+                                if hasattr(self.retriever, "ainvoke"):
+                                    docs = await self.retriever.ainvoke(query)
+                                elif hasattr(self.retriever, "aget_relevant_documents"):
+                                    docs = await self.retriever.aget_relevant_documents(query)
+                                elif hasattr(self.retriever, "invoke"):
+                                    docs = self.retriever.invoke(query)
+                                else:
+                                    # Fall back to sync if needed
+                                    docs = self.retriever.get_relevant_documents(query)
                                 
-                                async def _aget_relevant_documents(self, query, **kwargs):
-                                    """Async implementation for better performance."""
-                                    # Try to use invoke() first, which is the preferred LangChain method
-                                    if hasattr(self.retriever, "ainvoke"):
-                                        docs = await self.retriever.ainvoke(query)
-                                    elif hasattr(self.retriever, "aget_relevant_documents"):
-                                        docs = await self.retriever.aget_relevant_documents(query)
-                                    elif hasattr(self.retriever, "invoke"):
-                                        docs = self.retriever.invoke(query)
+                                # Add collection metadata
+                                for doc in docs:
+                                    if not hasattr(doc, 'metadata') or not doc.metadata:
+                                        doc.metadata = {"collection": self.collection}
                                     else:
-                                        # Fall back to sync if needed
-                                        docs = self.retriever.get_relevant_documents(query)
-                                    
-                                    # Add collection metadata
-                                    for doc in docs:
-                                        if isinstance(doc.metadata, dict):
-                                            doc.metadata["collection"] = self.collection
-                                        else:
-                                            doc.metadata = {"collection": self.collection}
-                                    return docs
-                            
-                            # Wrap with metadata transformer and add to retrievers dictionary
-                            self.retrievers[collection] = CollectionMetadataRetriever(base_retriever, collection)
-                            
-                            logger.info(f"Vector store and retriever for {collection} initialized")
-                            connected = True
-                            break
-                        else:
-                            logger.warning(f"Collection '{collection}' does not exist at {url}")
-                    except Exception as e:
-                        logger.error(f"Error checking collection '{collection}' at {url}: {str(e)}")
-                
-                if not connected:
-                    logger.warning(f"⚠️ Could not connect to collection '{collection}' on any server")
+                                        doc.metadata["collection"] = self.collection
+                                return docs
+                        
+                        # Wrap with metadata transformer and add to retrievers dictionary
+                        self.retrievers[collection] = CollectionMetadataRetriever(base_retriever, collection)
+                        
+                        logger.info(f"Vector store and retriever for {collection} initialized")
+                    else:
+                        logger.warning(f"Collection '{collection}' does not exist")
+                except Exception as e:
+                    logger.error(f"Error checking collection '{collection}': {str(e)}")
             
             if not self.vector_stores:
                 raise ValueError("No valid vector stores could be initialized")
@@ -505,7 +551,7 @@ class Pipeline:
         messages: List[dict],
         body: dict,
         __event_emitter__: Optional[Callable[[dict], None]] = None,
-    ) -> Generator[str, None, None]:
+    ) -> Generator[Any, None, None]:
         from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
         logger.info(f"Processing query: '{user_message}'")

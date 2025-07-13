@@ -37,7 +37,7 @@ class Pipeline:
         self.valves = self.Valves(**{
             "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", "your-api-key-here"),
             "OPENAI_MODEL": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            "QDRANT_URL": os.getenv("QDRANT_URL", "https://qdrant.homehub.tv"),
+            "QDRANT_URL": os.getenv("QDRANT_URL", "http://localhost:6333"),
             "SYSTEM_PROMPT": os.getenv("SYSTEM_PROMPT", 
                 """You are an assistant for question-answering tasks. 
                 Use the following pieces of retrieved context to answer 
@@ -175,9 +175,6 @@ class Pipeline:
             
             # Only add a references section if one doesn't already exist
             if not has_references:
-                # Output all references in a single line with spaces
-                yield "\n\n---\n\nReferences:\n\n"
-                
                 # Collect all references first
                 references = []
                 seen_sources = set()  # To avoid duplicates
