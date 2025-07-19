@@ -17,27 +17,28 @@ import pydantic
 from pydantic import BaseModel, Field
 
 # PocketFlow imports
-from pocketflow import Node, Flow
+from pocketflow import Node, Flow, AsyncNode, AsyncFlow, AsyncParallelBatchNode
 
 # Other imports
 import openai
 import ollama
+import asyncio
 
 # Configure logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-class CollectionRouterNode(Node):
-    """Routes user queries to relevant knowledge collections using PocketFlow Node pattern with Ollama"""
+class CollectionRouterNode(AsyncNode):
+    """Routes user queries to relevant knowledge collections using PocketFlow AsyncNode pattern with Ollama"""
     
-    def prep(self, shared):
+    async def prep_async(self, shared):
         """Extract query and available collections from shared context"""
         query = shared.get("user_query", "")
         collections = shared.get("available_collections", [])
         ollama_task_model = shared.get("ollama_task_model", "llama3.2:latest")
         return {"query": query, "collections": collections, "model": ollama_task_model}
     
-    def exec(self, inputs):
+    async def exec_async(self, inputs):
         """Determine relevant collections for the query using Ollama (local task model)"""
         query = inputs["query"]
         collections = inputs["collections"]
@@ -72,11 +73,17 @@ Response:"""
 
         try:
             # Use Ollama for collection routing (local task model)
-            response = ollama.chat(
-                model=model,
-                messages=[{"role": "user", "content": routing_prompt}],
-                options={"temperature": 0}  # Low temperature for deterministic routing
-            )
+            # Note: ollama.chat is synchronous, but we'll run it in an executor
+            def _ollama_call():
+                return ollama.chat(
+                    model=model,
+                    messages=[{"role": "user", "content": routing_prompt}],
+                    options={"temperature": 0}  # Low temperature for deterministic routing
+                )
+            
+            # Run in executor to avoid blocking
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(None, _ollama_call)
             
             selected_text = response['message']['content'].strip()
             selected = [name.strip() for name in selected_text.split(",")]
@@ -93,128 +100,150 @@ Response:"""
             logger.error(f"Collection routing failed: {e}")
             return collections  # Fallback to all collections
     
-    def post(self, shared, prep_res, exec_res):
+    async def post_async(self, shared, prep_res, exec_res):
         """Store selected collections and continue to retrieval"""
         shared["selected_collections"] = exec_res
         return "retrieve"
 
-class DocumentRetrieverNode(Node):
-    """Retrieves documents from selected collections using PocketFlow Node pattern"""
+class DocumentRetrieverNode(AsyncParallelBatchNode):
+    """Retrieves documents from selected collections in parallel using AsyncParallelBatchNode"""
     
-    def prep(self, shared):
-        """Extract query and selected collections"""
+    async def prep_async(self, shared):
+        """Prepare parameters for each collection to be processed in parallel"""
         query = shared.get("user_query", "")
         collections = shared.get("selected_collections", [])
         vector_stores = shared.get("vector_stores", {})
         max_docs = shared.get("max_docs_per_collection", 3)
-        return {"query": query, "collections": collections, "vector_stores": vector_stores, "max_docs": max_docs}
-    
-    def exec(self, inputs):
-        """Retrieve documents from Qdrant collections using Ollama embeddings"""
-        query = inputs["query"]
-        collections = inputs["collections"]
-        vector_stores = inputs["vector_stores"]
-        max_docs = inputs["max_docs"]
         
-        all_documents = []
-        
+        # Return list of parameters for parallel processing
+        collection_params = []
         for collection in collections:
-            if collection not in vector_stores:
+            if collection in vector_stores:
+                collection_params.append({
+                    "query": query,
+                    "collection": collection,
+                    "vector_store": vector_stores[collection],
+                    "max_docs": max_docs
+                })
+            else:
                 logger.warning(f"Collection {collection} not available")
-                continue
-                
-            try:
-                # Get retriever for this collection
-                retriever = vector_stores[collection].as_retriever(
-                    search_kwargs={"k": max_docs}
-                )
-                
-                # Retrieve documents (sync for simplicity in this context)
-                docs = retriever.invoke(query)
-                
-                # Add collection metadata
-                for doc in docs:
-                    if not hasattr(doc, 'metadata') or not doc.metadata:
-                        doc.metadata = {}
-                    doc.metadata['collection'] = collection
-                    doc.metadata['retrieved_at'] = datetime.now().isoformat()
-                
-                all_documents.extend(docs)
-                logger.info(f"Retrieved {len(docs)} documents from {collection}")
-                
-            except Exception as e:
-                logger.error(f"Error retrieving from {collection}: {e}")
-                
-        return all_documents
+        
+        return collection_params
     
-    def post(self, shared, prep_res, exec_res):
-        """Store retrieved documents and continue to processing"""
-        shared["documents"] = exec_res
+    async def exec_async(self, collection_param):
+        """Retrieve documents from a single collection (called in parallel for each collection)"""
+        query = collection_param["query"]
+        collection = collection_param["collection"]
+        vector_store = collection_param["vector_store"]
+        max_docs = collection_param["max_docs"]
+        
+        try:
+            # Get retriever for this collection
+            retriever = vector_store.as_retriever(
+                search_kwargs={"k": max_docs}
+            )
+            
+            # Retrieve documents (we need to make this async-compatible)
+            def _retrieve_docs():
+                return retriever.invoke(query)
+            
+            # Run in executor to avoid blocking
+            loop = asyncio.get_event_loop()
+            docs = await loop.run_in_executor(None, _retrieve_docs)
+            
+            # Add collection metadata
+            for doc in docs:
+                if not hasattr(doc, 'metadata') or not doc.metadata:
+                    doc.metadata = {}
+                doc.metadata['collection'] = collection
+                doc.metadata['retrieved_at'] = datetime.now().isoformat()
+            
+            logger.info(f"Retrieved {len(docs)} documents from {collection}")
+            return docs
+            
+        except Exception as e:
+            logger.error(f"Error retrieving from {collection}: {e}")
+            return []  # Return empty list on error
+    
+    async def post_async(self, shared, prep_res, exec_res_list):
+        """Combine documents from all collections and continue to processing"""
+        # Flatten the list of document lists
+        all_documents = []
+        for docs in exec_res_list:
+            all_documents.extend(docs)
+        
+        shared["documents"] = all_documents
+        logger.info(f"Retrieved total of {len(all_documents)} documents from {len(exec_res_list)} collections")
         return "process"
 
-class DocumentProcessorNode(Node):
-    """Processes documents to extract insights using PocketFlow Node pattern"""
+class DocumentProcessorNode(AsyncNode):
+    """Processes documents to extract insights using AsyncNode pattern"""
     
-    def prep(self, shared):
+    async def prep_async(self, shared):
         """Extract documents from shared context"""
         documents = shared.get("documents", [])
         return documents
     
-    def exec(self, documents):
+    async def exec_async(self, documents):
         """Extract insights and detect patterns in documents"""
-        insights = []
-        
-        if not documents:
-            return insights
+        def _process_documents():
+            insights = []
             
-        # Group documents by collection
-        collection_groups = {}
-        for doc in documents:
-            collection = getattr(doc, 'metadata', {}).get('collection', 'unknown')
-            if collection not in collection_groups:
-                collection_groups[collection] = []
-            collection_groups[collection].append(doc)
-        
-        # Generate insights about cross-collection patterns
-        if len(collection_groups) > 1:
-            insights.append(f"Found related information across {len(collection_groups)} different collections")
-            
-        # Check for temporal patterns
-        dates = []
-        for doc in documents:
-            metadata = getattr(doc, 'metadata', {})
-            if 'date' in metadata:
-                dates.append(metadata['date'])
-        
-        if len(dates) > 1:
-            insights.append(f"Information spans multiple time periods ({len(dates)} dated entries)")
-        
-        # Basic contradiction detection
-        doc_texts = [getattr(doc, 'page_content', str(doc)).lower() for doc in documents]
-        contradiction_keywords = [
-            ("yes", "no"), ("true", "false"), ("agree", "disagree"),
-            ("positive", "negative"), ("increase", "decrease"),
-            ("support", "oppose"), ("accept", "reject")
-        ]
-        
-        for pos_word, neg_word in contradiction_keywords:
-            pos_found = any(pos_word in text for text in doc_texts)
-            neg_found = any(neg_word in text for text in doc_texts)
-            
-            if pos_found and neg_found:
-                insights.append(f"Found potential contradiction: references to both '{pos_word}' and '{neg_word}'")
+            if not documents:
+                return insights
                 
-        return insights
+            # Group documents by collection
+            collection_groups = {}
+            for doc in documents:
+                collection = getattr(doc, 'metadata', {}).get('collection', 'unknown')
+                if collection not in collection_groups:
+                    collection_groups[collection] = []
+                collection_groups[collection].append(doc)
+            
+            # Generate insights about cross-collection patterns
+            if len(collection_groups) > 1:
+                insights.append(f"Found related information across {len(collection_groups)} different collections")
+                
+            # Check for temporal patterns
+            dates = []
+            for doc in documents:
+                metadata = getattr(doc, 'metadata', {})
+                if 'date' in metadata:
+                    dates.append(metadata['date'])
+            
+            if len(dates) > 1:
+                insights.append(f"Information spans multiple time periods ({len(dates)} dated entries)")
+            
+            # Basic contradiction detection
+            doc_texts = [getattr(doc, 'page_content', str(doc)).lower() for doc in documents]
+            contradiction_keywords = [
+                ("yes", "no"), ("true", "false"), ("agree", "disagree"),
+                ("positive", "negative"), ("increase", "decrease"),
+                ("support", "oppose"), ("accept", "reject")
+            ]
+            
+            for pos_word, neg_word in contradiction_keywords:
+                pos_found = any(pos_word in text for text in doc_texts)
+                neg_found = any(neg_word in text for text in doc_texts)
+                
+                if pos_found and neg_found:
+                    insights.append(f"Found potential contradiction: references to both '{pos_word}' and '{neg_word}'")
+                    
+            return insights
+        
+        # Run in executor to avoid blocking if processing becomes heavy
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _process_documents)
     
-    def post(self, shared, prep_res, exec_res):
+    async def post_async(self, shared, prep_res, exec_res):
         """Store insights and continue to response generation"""
         shared["insights"] = exec_res
         return "generate"
 
-class ResponseGeneratorNode(Node):
-    """Generates responses using PocketFlow Node pattern with OpenAI"""
+class ResponseGeneratorNode(AsyncNode):
+    """Generates responses using AsyncNode pattern with OpenAI"""
     
-    def prep(self, shared):
+    async def prep_async(self, shared):
         """Extract all context needed for response generation"""
         return {
             "query": shared.get("user_query", ""),
@@ -223,7 +252,7 @@ class ResponseGeneratorNode(Node):
             "collections": shared.get("selected_collections", [])
         }
     
-    def exec(self, inputs):
+    async def exec_async(self, inputs):
         """Build context for OpenAI response generation"""
         query = inputs["query"]
         documents = inputs["documents"]
@@ -265,7 +294,7 @@ Remember: Your goal is to be a thought partner, not just an information retrieve
             "documents": documents
         }
     
-    def post(self, shared, prep_res, exec_res):
+    async def post_async(self, shared, prep_res, exec_res):
         """Store response context and end flow"""
         shared["response_context"] = exec_res
         return "default"  # End of flow
@@ -289,7 +318,7 @@ class Pipeline:
         # Available collections
         self.collections = ["personal", "research", "projects", "entities", "chat_history"]
         
-        # Initialize PocketFlow nodes
+        # Initialize PocketFlow async nodes
         self.router_node = CollectionRouterNode()
         self.retriever_node = DocumentRetrieverNode()
         self.processor_node = DocumentProcessorNode()
@@ -300,8 +329,8 @@ class Pipeline:
         self.retriever_node - "process" >> self.processor_node
         self.processor_node - "generate" >> self.generator_node
         
-        # Create the PocketFlow flow
-        self.chat_flow = Flow(start=self.router_node)
+        # Create the PocketFlow async flow
+        self.chat_flow = AsyncFlow(start=self.router_node)
         
         # Initialize valves with environment overrides
         self.valves = self.Valves(
@@ -451,9 +480,26 @@ class Pipeline:
                 "enable_insights": self.valves.ENABLE_INSIGHTS
             }
             
-            # Run the PocketFlow flow
+            # Run the PocketFlow async flow in sync context
             logger.info("Running PocketFlow chat flow...")
-            self.chat_flow.run(shared)
+            
+            async def run_async_flow():
+                return await self.chat_flow.run_async(shared)
+            
+            # Run the async flow - handle different event loop scenarios
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If event loop is already running, we need to run in a thread
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(asyncio.run, run_async_flow())
+                        future.result()
+                else:
+                    loop.run_until_complete(run_async_flow())
+            except RuntimeError:
+                # No event loop exists, create one
+                asyncio.run(run_async_flow())
             
             # Get the response context from the flow execution
             response_context = shared.get("response_context", {})
