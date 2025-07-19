@@ -5,7 +5,7 @@ date: 2024-12-30
 version: 1.0
 license: MIT
 description: A pipeline for retrieving relevant information from a knowledge base using langchain with citations.
-requirements: langchain==0.3.3, langchain_core==0.3.10, langchain_openai==0.3.18, openai==1.82.0, langchain_qdrant==0.2.0, qdrant_client==1.11.0, pydantic==2.7.4
+requirements: langchain==0.3.3, langchain_core==0.3.10, langchain_openai==0.3.18, openai==1.82.0, langchain_qdrant==0.2.0, qdrant_client==1.11.0, pydantic==2.7.4, langchain_ollama
 """
 
 import os
@@ -28,6 +28,8 @@ class Pipeline:
         QDRANT_URL: str
         SYSTEM_PROMPT: str
         OBSIDIAN_VAULT_NAME: str
+        OLLAMA_EMBEDDING_MODEL: str = "nomic-embed-text:latest"
+        OLLAMA_BASE_URL: str = "http://localhost:11434"
         model_config = {"extra": "allow"}
 
     def __init__(self):
@@ -45,10 +47,13 @@ class Pipeline:
                 don't know.
                 """),
             "OBSIDIAN_VAULT_NAME": os.getenv("OBSIDIAN_VAULT_NAME", "MyVault"),
+            "OLLAMA_EMBEDDING_MODEL": os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text:latest"),
+            "OLLAMA_BASE_URL": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         })
 
     async def on_startup(self):
-        from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+        from langchain_openai import ChatOpenAI
+        from langchain_ollama import OllamaEmbeddings
         from langchain_qdrant import QdrantVectorStore
         from qdrant_client import QdrantClient
         
@@ -61,8 +66,11 @@ class Pipeline:
                 raise ValueError("Collection 'personal' does not exist")
             print("Collection exists")
             
-            embeddings = OpenAIEmbeddings(model="text-embedding-3-large", api_key=self.valves.OPENAI_API_KEY)
-            print("Embeddings initialized")
+            embeddings = OllamaEmbeddings(
+                model=self.valves.OLLAMA_EMBEDDING_MODEL,
+                base_url=self.valves.OLLAMA_BASE_URL,
+            )
+            print(f"Embeddings initialized with Ollama model {self.valves.OLLAMA_EMBEDDING_MODEL} at {self.valves.OLLAMA_BASE_URL}")
             
             self.vector_store = QdrantVectorStore(
                 client=client,

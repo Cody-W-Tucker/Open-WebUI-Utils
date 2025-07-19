@@ -5,7 +5,7 @@ date: 2024-12-30
 version: 1.0
 license: MIT
 description: A pipeline for retrieving and synthesizing information across multiple knowledge bases.
-requirements: langchain==0.3.3, langchain_core==0.3.10, langchain_openai==0.3.18, openai==1.82.0, langchain_qdrant==0.2.0, qdrant_client==1.11.0, pydantic==2.7.4
+requirements: langchain==0.3.3, langchain_core==0.3.10, langchain_openai==0.3.18, openai==1.82.0, langchain_qdrant==0.2.0, qdrant_client==1.11.0, pydantic==2.7.4, langchain_ollama
 """
 
 import os
@@ -55,7 +55,8 @@ class Pipeline:
         OPENAI_API_KEY: str
         TASK_OPENAI_MODEL: str = "gpt-4o-mini-2024-07-18"
         LARGE_OPENAI_MODEL: str = "gpt-4o-2024-11-20"
-        OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-large"
+        OLLAMA_EMBEDDING_MODEL: str = "nomic-embed-text:latest"
+        OLLAMA_BASE_URL: str = "http://localhost:11434"
         SYSTEM_PROMPT: str
         MAX_DOCUMENTS_PER_COLLECTION: int = 5
         QDRANT_URL: str
@@ -98,7 +99,8 @@ class Pipeline:
             OPENAI_API_KEY=os.getenv("OPENAI_API_KEY", "your-api-key-here"),
             TASK_OPENAI_MODEL=os.getenv("TASK_OPENAI_MODEL", "gpt-4o-mini-2024-07-18"),
             LARGE_OPENAI_MODEL=os.getenv("LARGE_OPENAI_MODEL", "gpt-4o-2024-11-20"),
-            OPENAI_EMBEDDING_MODEL=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large"),
+            OLLAMA_EMBEDDING_MODEL=os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text:latest"),
+            OLLAMA_BASE_URL=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
             SYSTEM_PROMPT=os.getenv("SYSTEM_PROMPT", 
                 """You are a dynamic knowledge partner capable of synthesizing insights across multiple sources.
                 Use the provided context to not just answer questions, but to highlight connections, 
@@ -123,17 +125,18 @@ class Pipeline:
         return lc_msgs
 
     async def on_startup(self):
-        from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+        from langchain_openai import ChatOpenAI
+        from langchain_ollama import OllamaEmbeddings
         from langchain_qdrant import QdrantVectorStore
         from qdrant_client import QdrantClient
         
         try:
             logger.info("Starting initialization...")
-            self.embeddings = OpenAIEmbeddings(
-                model=self.valves.OPENAI_EMBEDDING_MODEL, 
-                api_key=self.valves.OPENAI_API_KEY
+            self.embeddings = OllamaEmbeddings(
+                model=self.valves.OLLAMA_EMBEDDING_MODEL,
+                base_url=self.valves.OLLAMA_BASE_URL,
             )
-            logger.info(f"Embeddings initialized with model {self.valves.OPENAI_EMBEDDING_MODEL}")
+            logger.info(f"Embeddings initialized with Ollama model {self.valves.OLLAMA_EMBEDDING_MODEL} at {self.valves.OLLAMA_BASE_URL}")
             
             # Print the collections we're trying to connect to
             logger.info(f"Attempting to connect to collections: {', '.join(self.QDRANT_COLLECTIONS)}")
