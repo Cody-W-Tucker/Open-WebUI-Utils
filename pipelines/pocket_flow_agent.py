@@ -314,6 +314,7 @@ class Pipeline:
     def __init__(self):
         self.name = "PocketFlow Chat Agent"
         self.vector_stores = {}
+        self.citation = False  # Disable Open WebUI's built-in citations
         
         # Available collections
         self.collections = ["personal", "research", "projects", "entities", "chat_history"]
@@ -542,7 +543,7 @@ class Pipeline:
                 # Emit citations for retrieved documents
                 documents = response_context.get("documents", [])
                 if documents:
-                    self._emit_citations(documents, __event_emitter__)
+                    yield from self._emit_citations(documents)
                 
             except Exception as e:
                 logger.error(f"Response generation failed: {e}")
@@ -558,11 +559,8 @@ class Pipeline:
                 __event_emitter__({"type": "stream", "data": error_msg})
             yield error_msg
 
-    def _emit_citations(self, documents: List[Any], event_emitter: Optional[Callable] = None):
+    def _emit_citations(self, documents: List[Any]):
         """Emit citation events for retrieved documents"""
-        if not event_emitter:
-            return
-            
         seen_sources = set()
         
         for doc in documents:
@@ -575,17 +573,17 @@ class Pipeline:
                 continue
             seen_sources.add(source)
             
-            # Emit citation event
+            # Yield citation event in the format expected by Open WebUI Pipelines
             yield {
                 "event": {
                     "type": "citation",
                     "data": {
-                        "document": [getattr(doc, 'page_content', str(doc))],
+                        "document": [self._extract_page_content(doc)],
                         "metadata": [
                             {
                                 "source": source,
                                 "collection": collection,
-                                "retrieved_at": metadata.get("retrieved_at", datetime.now().isoformat()),
+                                "date_accessed": metadata.get("retrieved_at", datetime.now().isoformat()),
                             }
                         ],
                         "source": {
@@ -593,4 +591,77 @@ class Pipeline:
                         }
                     }
                 }
-            } 
+            }
+    
+    def _extract_page_content(self, doc):
+        """Extract page_content from document by parsing JSON string"""
+        import json
+        import ast
+        
+        # Get the string representation of the document
+        doc_str = str(doc) if not hasattr(doc, 'page_content') else getattr(doc, 'page_content', str(doc))
+        
+        # If it looks like a dictionary string, try to parse it
+        if doc_str.strip().startswith('{') and doc_str.strip().endswith('}'):
+            try:
+                # Try JSON first (double quotes)
+                parsed = json.loads(doc_str)
+                if 'page_content' in parsed:
+                    content = parsed['page_content']
+                    return self._strip_markdown(content)
+            except json.JSONDecodeError:
+                try:
+                    # Try Python literal_eval for single quotes
+                    parsed = ast.literal_eval(doc_str)
+                    if isinstance(parsed, dict) and 'page_content' in parsed:
+                        content = parsed['page_content']
+                        return self._strip_markdown(content)
+                except (ValueError, SyntaxError):
+                    pass
+        
+        # If the doc has page_content attribute, use that
+        if hasattr(doc, 'page_content') and doc.page_content:
+            return self._strip_markdown(doc.page_content)
+            
+        # Fallback to original string
+        return self._strip_markdown(doc_str)
+    
+    def _strip_markdown(self, text):
+        """Strip Obsidian markdown elements while preserving newlines"""
+        import re
+        
+        if not text:
+            return text
+            
+        # Remove Obsidian-style links [[link]] but keep the text
+        text = re.sub(r'\[\[([^\]]+)\]\]', r'\1', text)
+        
+        # Remove markdown links [text](url) but keep the text
+        text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+        
+        # Remove bold **text** and keep the text
+        text = re.sub(r'\*\*([^\*]+)\*\*', r'\1', text)
+        
+        # Remove italic *text* and _text_ and keep the text
+        text = re.sub(r'\*([^\*]+)\*', r'\1', text)
+        text = re.sub(r'_([^_]+)_', r'\1', text)
+        
+        # Remove highlights ==text== and keep the text
+        text = re.sub(r'==([^=]+)==', r'\1', text)
+        
+        # Remove strikethrough ~~text~~ and keep the text
+        text = re.sub(r'~~([^~]+)~~', r'\1', text)
+        
+        # Remove inline code `text` and keep the text
+        text = re.sub(r'`([^`]+)`', r'\1', text)
+        
+        # Remove headers # ## ### etc but keep the text
+        text = re.sub(r'^#{1,6}\s+(.+)$', r'\1', text, flags=re.MULTILINE)
+        
+        # Remove blockquote markers > but keep the text and indentation
+        text = re.sub(r'^>\s*', '', text, flags=re.MULTILINE)
+        
+        # Clean up any remaining double spaces
+        text = re.sub(r'  +', ' ', text)
+        
+        return text.strip()
